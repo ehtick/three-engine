@@ -657,6 +657,15 @@ export function SceneSettingsPanel() {
             onChange={(v) => commitRenderer({ transparent: v }, "Toggle transparent canvas")}
           />
         </Row>
+        <Row
+          label="Reversed depth (far-range precision)"
+          hint="Fixes distant z-fighting on km-scale worlds. Rebuilds the renderer (GI and every material recompile)."
+        >
+          <Toggle
+            checked={renderer.reversedDepth === true}
+            onChange={(v) => commitRenderer({ reversedDepth: v }, "Toggle reversed depth")}
+          />
+        </Row>
       </Section>
     </div>
   );

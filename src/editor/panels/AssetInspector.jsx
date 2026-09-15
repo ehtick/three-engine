@@ -611,7 +611,7 @@ function ModelPreview({ path }) {
         const canvas = canvasRef.current;
         if (!canvas) return;
         renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true });
-        renderer.setPixelRatio(window.devicePixelRatio ?? 1);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, 2));
         await renderer.init();
         if (disposed) return;
         const width = canvas.clientWidth || 280;

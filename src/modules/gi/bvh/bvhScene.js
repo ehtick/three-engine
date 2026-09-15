@@ -628,20 +628,33 @@ const bvhMeshFirstHitFn = wgslFn(/* wgsl */ `
 
 ` );
 
-// Tile grid for the per-mesh albedo atlas (buildAlbedoAtlas): GRID² tiles of
-// 256x256 >= MAX_BVH_MESHES, and the tile index IS the mesh table
-// index (offsets/aabbMin/worldToLocal's own `i`) — no separate mesh->tile
-// map to keep in sync. Bump one, check the other. Exported so giScreen.js's
-// blitBvhAtlasTiles can compute the same per-tile pixel rects when it
-// GPU-renders tiles the canvas 2D path here could not draw.
+// Tile grid for the seated albedo atlas (buildAlbedoAtlas). Tiles are keyed
+// by MATERIAL, not by mesh, and the per-mesh `albedoTile` uniform carries the
+// rect — the grid is NOT sized to MAX_BVH_MESHES.
+//
+// ⚠ It used to be: tile index === mesh table index, "GRID² >= MAX_BVH_MESHES".
+// The cap went 128 → 512 (ball pool) and the grid stayed 12, so meshes 144+
+// got tile rects below the 3072 target and every GPU blit pass failed
+// validation ("Scissor rect (x, 4608, 256, 0) is not contained in the render
+// area", then "Invalid CommandBuffer" for the rest of the frame; 2026-09-14,
+// 327-mesh scene). The last tile is a swatch sheet (ALBEDO_SWATCH_PX) for
+// map-less and over-cap materials, so every mesh has a valid rect.
+//
+// Exported so giScreen.js's blitBvhAtlasTiles can compute the same per-tile
+// pixel rects when it GPU-renders tiles the canvas 2D path here could not draw.
 export const ALBEDO_ATLAS_TILE = 256;
-export const ALBEDO_ATLAS_GRID = 12; // 12 * 12 = 144 >= MAX_BVH_MESHES (128)
+export const ALBEDO_ATLAS_GRID = 12;
 export const ALBEDO_ATLAS_SIZE = ALBEDO_ATLAS_TILE * ALBEDO_ATLAS_GRID; // 3072
+/** Textured tiles; the last grid tile is the swatch sheet. */
+const ALBEDO_TEXTURE_TILES = ALBEDO_ATLAS_GRID * ALBEDO_ATLAS_GRID - 1; // 143
+/** Flat-colour swatches inside the last tile: 16x16 of 16 px = 256 colours. */
+const ALBEDO_SWATCH_PX = 16;
+const ALBEDO_SWATCH_GRID = ALBEDO_ATLAS_TILE / ALBEDO_SWATCH_PX;
 
 /**
  * Bakes one atlas of per-mesh albedo (GI Phase 3 v2 — texture-at-hit, see
- * docs/GI_PLAN.md): a 2048x2048 canvas, 8x8 grid of 256x256 tiles, tile
- * index === the mesh's table index. A mesh whose material carries a
+ * docs/GI_PLAN.md): a 3072x3072 canvas, 12x12 grid of 256x256 tiles, one
+ * tile per textured MATERIAL (see ALBEDO_ATLAS_GRID). A mesh whose material carries a
  * drawable `.map` gets its actual texture image drawn into its tile — this
  * is what retires the old "one mean color per mesh" approximation
  * (`giField.js`'s `hitSurfaceFn`/`atlas.albedo`) for BVH reflection hits.
@@ -705,8 +718,7 @@ function drawAlbedoTile(ctx, material, i, pendingGpuTiles, tilePx = ALBEDO_ATLAS
     }
   }
   if (!drew) {
-    const channel = (value) => Math.round(Math.min(1, Math.max(0, Number(value) || 0)) * 255);
-    ctx.fillStyle = `rgb(${channel(tint.r)}, ${channel(tint.g)}, ${channel(tint.b)})`;
+    ctx.fillStyle = tintStyle(tint);
     ctx.fillRect(tileX, tileY, tilePx, tilePx);
   }
   // GPU-blit candidate: the canvas draw failed for any reason (no
@@ -724,6 +736,36 @@ function drawAlbedoTile(ctx, material, i, pendingGpuTiles, tilePx = ALBEDO_ATLAS
     pendingGpuTiles.push({ map, tileIndex: i, tint: { r: tint.r, g: tint.g, b: tint.b } });
   }
   return drew;
+}
+
+function tintStyle(tint) {
+  const channel = (value) => Math.round(Math.min(1, Math.max(0, Number(value) || 0)) * 255);
+  return `rgb(${channel(tint.r)}, ${channel(tint.g)}, ${channel(tint.b)})`;
+}
+
+/**
+ * One flat swatch on the seated atlas's swatch sheet: a map-less material's
+ * colour, or an over-cap textured material squeezed to ALBEDO_SWATCH_PX (a
+ * rough colour, never a hole). Never queued for the GPU blit — a swatch is
+ * sampled at its centre, so there is no texture detail for the GPU to add.
+ */
+function drawAlbedoSwatch(ctx, material, x, y) {
+  const { map, tint } = resolveMaterialAlbedo(material);
+  const image = map ? (map.image ?? map.source?.data) : null;
+  let drew = false;
+  if (image && image.width > 0 && image.height > 0) {
+    try {
+      ctx.drawImage(image, x, y, ALBEDO_SWATCH_PX, ALBEDO_SWATCH_PX);
+      drew = true;
+    } catch {
+      drew = false; // compressed / not CPU-readable — tint only
+    }
+  }
+  ctx.save();
+  if (drew) ctx.globalCompositeOperation = "multiply";
+  ctx.fillStyle = tintStyle(tint);
+  ctx.fillRect(x, y, ALBEDO_SWATCH_PX, ALBEDO_SWATCH_PX);
+  ctx.restore();
 }
 
 function finishAtlas(canvas) {
@@ -747,11 +789,37 @@ function buildAlbedoAtlas(entries) {
   // blitBvhAtlasTiles (giScreen.js), which clears this back to [] once the
   // GPU pass has overwritten them for real (see that function's comment).
   const pendingGpuTiles = [];
-  entries.forEach((entry, i) => {
+  const sheetX = (ALBEDO_TEXTURE_TILES % ALBEDO_ATLAS_GRID) * ALBEDO_ATLAS_TILE;
+  const sheetY = Math.floor(ALBEDO_TEXTURE_TILES / ALBEDO_ATLAS_GRID) * ALBEDO_ATLAS_TILE;
+  const swatchCapacity = ALBEDO_SWATCH_GRID * ALBEDO_SWATCH_GRID;
+  // material -> [originU, originV, scale]; scale 0 = a swatch sampled at its centre.
+  const rectOfMaterial = new Map();
+  let tiles = 0;
+  let swatches = 0;
+  const tileRects = entries.map((entry) => {
     const material = Array.isArray(entry.mesh.material) ? entry.mesh.material[0] : entry.mesh.material;
-    if (drawAlbedoTile(ctx, material, i, pendingGpuTiles)) texturedCount++;
+    let rect = rectOfMaterial.get(material);
+    if (rect) return rect;
+    if (resolveMaterialAlbedo(material).map && tiles < ALBEDO_TEXTURE_TILES) {
+      const i = tiles++;
+      if (drawAlbedoTile(ctx, material, i, pendingGpuTiles)) texturedCount++;
+      rect = [(i % ALBEDO_ATLAS_GRID) / ALBEDO_ATLAS_GRID, Math.floor(i / ALBEDO_ATLAS_GRID) / ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_TILE / ALBEDO_ATLAS_SIZE];
+    } else {
+      // Past the sheet's capacity swatches wrap: shared colours, still in bounds.
+      const s = swatches++ % swatchCapacity;
+      const x = sheetX + (s % ALBEDO_SWATCH_GRID) * ALBEDO_SWATCH_PX;
+      const y = sheetY + Math.floor(s / ALBEDO_SWATCH_GRID) * ALBEDO_SWATCH_PX;
+      drawAlbedoSwatch(ctx, material, x, y);
+      const half = ALBEDO_SWATCH_PX / 2;
+      rect = [(x + half) / ALBEDO_ATLAS_SIZE, (y + half) / ALBEDO_ATLAS_SIZE, 0];
+    }
+    rectOfMaterial.set(material, rect);
+    return rect;
   });
-  return { atlasTexture: finishAtlas(canvas), texturedCount, pendingGpuTiles };
+  if (swatches > swatchCapacity) {
+    console.warn(`[gi] bvh atlas: ${swatches} flat materials exceed the ${swatchCapacity}-swatch sheet — extras share colours in reflections`);
+  }
+  return { atlasTexture: finishAtlas(canvas), texturedCount, pendingGpuTiles, tileRects };
 }
 
 /**
@@ -1014,10 +1082,10 @@ export function buildBvhScene(meshes) {
   // x=nodeOffset, y=indexOffset (tri units), z=positionOffset (vertex units), w=rootIndex.
   const offsets = uniformArray(Array.from({ length: capacity }, () => new THREE.Vector4()));
   const meshCountUniform = uniform(entries.length, "int");
-  // x=ox, y=oy (both 0..1 atlas UV, tile origin), z=tileScale (TILE/ATLAS_SIZE), w=1.
-  // Capacity-fixed at MAX_BVH_MESHES like the tables above — tile index i
-  // IS the mesh table index (see buildAlbedoAtlas), so this needs no extra
-  // indirection.
+  // x=ox, y=oy (both 0..1 atlas UV, tile origin), z=tileScale (TILE/ATLAS_SIZE,
+  // or 0 for a flat swatch), w=1. Capacity-fixed at MAX_BVH_MESHES like the
+  // tables above; indexed by mesh, but the rect is its MATERIAL's tile (see
+  // buildAlbedoAtlas) — meshes sharing a material share a tile.
   const albedoTile = uniformArray(Array.from({ length: capacity }, () => new THREE.Vector4()));
 
   // Coverage table for meshes the BVH can't see (skinned etc.): live world
@@ -1039,11 +1107,9 @@ export function buildBvhScene(meshes) {
   // Albedo atlas: built once per scene (mesh-SET cadence, same as the BLAS
   // buffers above — a per-frame transform update never touches this), so a
   // moving mesh is still free and only add/remove/material-swap repaints it.
-  const { atlasTexture, texturedCount, pendingGpuTiles } = buildAlbedoAtlas(entries);
-  entries.forEach((entry, i) => {
-    const tileX = i % ALBEDO_ATLAS_GRID;
-    const tileY = Math.floor(i / ALBEDO_ATLAS_GRID);
-    albedoTile.array[i].set(tileX / ALBEDO_ATLAS_GRID, tileY / ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_TILE / ALBEDO_ATLAS_SIZE, 1);
+  const { atlasTexture, texturedCount, pendingGpuTiles, tileRects } = buildAlbedoAtlas(entries);
+  tileRects.forEach(([ox, oy, scale], i) => {
+    albedoTile.array[i].set(ox, oy, scale, 1);
   });
   // Persistent TextureNode wrapping the atlas — kept as a real JS reference
   // (not a fresh `texture(atlasTexture, uv)` built inline per call) so

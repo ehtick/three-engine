@@ -1,6 +1,6 @@
 import { WATER_MATERIAL_PATH } from "../../engine/builtinMaterials.js";
 import { splitGeometryIslandsWithPrompt, canSplitEntity } from "../geometrySplit.js";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X, ListChecks, Crosshair, Building2, PersonStanding, Layers } from "../icons/index.jsx";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore, selectedIdSet } from "../store/selectionStore.js";
@@ -1278,6 +1278,13 @@ export function HierarchyPanel() {
   const [draggingIds, setDraggingIds] = useState([]);
   const [ghostPos, setGhostPos] = useState(null); // {x, y}
   const [searchQuery, setSearchQuery] = useState("");
+  // The search box stays bound to `searchQuery` so every keystroke paints
+  // immediately. The scene-tree index, the entity subscription gate, and
+  // the highlight parser all consume `deferredSearchQuery`, which React is
+  // allowed to lag behind by a frame. Without this, building the per-node
+  // match index over the full entity tree blocks the input for the duration
+  // the file already documents ("1.2 SECONDS per character typed").
+  const deferredSearchQuery = useDeferredValue(searchQuery);
   // Keyboard cursor: the row the arrows move from. Distinct from the selection
   // anchor because Shift+Arrow has to grow a range while the anchor stays put.
   const cursorRef = useRef(null);
@@ -1509,8 +1516,8 @@ export function HierarchyPanel() {
   // updateTransform replaces the map object per pointermove. With no
   // query the selector returns a stable null and drag frames skip React
   // entirely.
-  const entities = useSceneStore((s) => (searchQuery.trim() ? s.entities : null));
-  const searchMatches = useMemo(() => buildSearchIndex(rootIds, entities, searchQuery), [rootIds, entities, searchQuery]);
+  const entities = useSceneStore((s) => (deferredSearchQuery.trim() ? s.entities : null));
+  const searchMatches = useMemo(() => buildSearchIndex(rootIds, entities, deferredSearchQuery), [rootIds, entities, deferredSearchQuery]);
   // No more ancestor-aware collapse overlay: in search mode the row hides
   // anything that isn't a match, so the user's saved `collapsedIds` is
   // simply ignored. Clearing the search restores the exact prior state.
@@ -1521,8 +1528,8 @@ export function HierarchyPanel() {
   // term, a component type), where highlighting a fragment of the name would
   // invent a reason for the match.
   const searchHighlight = useMemo(
-    () => highlightFor(parseQuery(searchQuery), searchQuery.trim()),
-    [searchQuery],
+    () => highlightFor(parseQuery(deferredSearchQuery), deferredSearchQuery.trim()),
+    [deferredSearchQuery],
   );
 
   // A query becomes a "recent" on Enter, or after 900 ms of not typing —

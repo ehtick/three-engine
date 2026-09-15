@@ -10,6 +10,7 @@ import { MeshBVH } from "three-mesh-bvh";
 import { faceVerts } from "./bmesh.js";
 import { tessellate, wireSegments } from "./tessellate.js";
 import { bufferGeometryFromMesh } from "./io.js";
+import { isNdcDepthInside } from "../../engine/reversedDepth.js";
 
 export const WIRE_COLOR = 0x22272b;
 export const SELECT_COLOR = 0xff9b42;
@@ -359,7 +360,8 @@ function occlusionTest(session) {
   return (point) => {
     world.copy(point).applyMatrix4(meshObject.matrixWorld);
     _ndc.copy(world).project(session.camera);
-    if (_ndc.z < -1 || _ndc.z > 1) return false;
+    // Depth range per camera convention (WebGPU [0,1], reversed [1,0]).
+    if (!isNdcDepthInside(_ndc.z, session.camera)) return false;
     // Via the camera rather than "origin → point": an ORTHOGRAPHIC camera's
     // rays do not share an origin, so a ray built from `camera.position` would
     // be wrong for every point off the view axis. `setFromCamera` handles both

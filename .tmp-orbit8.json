@@ -1,0 +1,23 @@
+{
+  "seconds": 20,
+  "degPerSec": 10,
+  "frames": 1605,
+  "fps": 80.3,
+  "fpsStats": 79,
+  "gpuMs": 12.24,
+  "gpuRenderMs": 12.24,
+  "gpuComputeMs": 0,
+  "cpuMs": 7.99,
+  "worldDispatches": 0,
+  "worldDispatchesPerSec": 0,
+  "motionRestFrames": 0,
+  "worldHz": null,
+  "worldRested": null,
+  "worldMotionRest": null,
+  "worldStaggered": null,
+  "worldSplit": null,
+  "worldChainsPerSec": null,
+  "restTerms": null,
+  "dispatchesPerSec": {},
+  "note": "Read during steady motion (the EMA settles in ~0.5 s). `worldDispatchesPerSec` is the world chain's REAL rate over the window — 30 = every frame at 30 fps, ~15 = the rest cadence held under motion. `gpuComputeMs` is the GI chains; `gpuRenderMs` the raster."
+}

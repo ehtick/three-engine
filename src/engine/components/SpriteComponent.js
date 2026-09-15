@@ -1,6 +1,6 @@
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
-import { loadTextureAsset } from "../textureAsset.js";
+import { acquireTextureAsset, releaseTextureAsset } from "../textureAsset.js";
 import {
   atlasImagePath,
   findAnimation,
@@ -144,7 +144,7 @@ export class SpriteComponent extends Component {
     }
     this.geometry?.dispose();
     this.geometry = null;
-    this.loadedTexture?.dispose();
+    releaseTextureAsset(this.loadedTexture);
     this.loadedTexture = null;
     this.atlasDef = null;
   }
@@ -224,12 +224,13 @@ export class SpriteComponent extends Component {
         this.#refresh();
         return;
       }
-      const texture = await loadTextureAsset(imagePath, { colorSpace: THREE.SRGBColorSpace });
+      // Shared, read-only: sprites of one sheet share a single GPU texture.
+      const texture = await acquireTextureAsset(imagePath, { colorSpace: THREE.SRGBColorSpace });
       if (generation !== this.generation || !this.mesh) {
-        texture.dispose();
+        releaseTextureAsset(texture);
         return;
       }
-      this.loadedTexture?.dispose();
+      releaseTextureAsset(this.loadedTexture);
       this.loadedTexture = texture;
       this.mesh.material.map = texture;
       this.mesh.material.needsUpdate = true;

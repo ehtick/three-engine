@@ -54,7 +54,8 @@ try {
   });
   page.on("pageerror", (error) => errors.push(String(error.stack ?? error)));
   say(`load ${url}, physical ${width}x${height}`);
-  await page.goto(url, { waitUntil: "load", timeout: 60000 });
+  // The player resolves GPU timestamps only when asked; this profile reads them.
+  await page.goto(`${url}${url.includes("?") ? "&" : "?"}timestamps=1`, { waitUntil: "load", timeout: 60000 });
   await page.waitForFunction(() => {
     const e = globalThis.__engine, s = e?.modules?.get("gi")?.system;
     // _frame can reset on a geometry revision while physics is active; it

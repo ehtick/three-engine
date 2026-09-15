@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, memo } from "react";
 import {
   ArrowUp,
   Box,
@@ -589,7 +589,7 @@ function FlagBadges({ path }) {
   );
 }
 
-function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextMenu, subtitle, folderSize }) {
+function AssetItemImpl({ entry, view, visible, renaming, setRenamingPath, onContextMenu, subtitle, folderSize }) {
   const draggable = entry.is_dir || DRAGGABLE_EXTENSIONS.includes(entry.ext);
   const selected = useSelectionStore((s) => s.assetPaths.includes(entry.path));
   // "Revealed" is the inspector pointing at this file (see assetReveal.js) —
@@ -685,6 +685,24 @@ function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextM
     </div>
   );
 }
+
+// Memoize so a keystroke that changes `visible` doesn't re-render every tile.
+// `visible` is the filter result array — its reference rotates on every
+// keystroke but AssetItem only reads it inside event handlers (shift-click
+// range select), never during render; comparing it in the equality check
+// would defeat the memo. The four Zustand subscriptions (`selection` /
+// `reveal` / `excluded` / `tags`) keep working unchanged because each
+// `useStore` selector already short-circuits when its slice is referentially
+// stable.
+const AssetItem = memo(AssetItemImpl, (prev, next) =>
+  prev.entry === next.entry &&
+  prev.view === next.view &&
+  prev.renaming === next.renaming &&
+  prev.subtitle === next.subtitle &&
+  prev.folderSize === next.folderSize &&
+  prev.setRenamingPath === next.setRenamingPath &&
+  prev.onContextMenu === next.onContextMenu,
+);
 
 function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries, onResize }) {
   const entry = menu.entry;
@@ -991,6 +1009,12 @@ export function AssetsPanel() {
     });
   }, []);
   const [query, setQuery] = useState("");
+  // The search box stays bound to `query` so every keystroke paints
+  // immediately; the filter, recursion, and tile render all consume
+  // `deferredQuery`, which React is allowed to lag behind by a frame. Without
+  // this split a 3,000-entry `pool.filter(...)` + N-tile re-render would
+  // block the input for tens-to-hundreds of milliseconds per character.
+  const deferredQuery = useDeferredValue(query);
   const [typeId, setTypeId] = useState("all");
   const [typeMenuOpen, setTypeMenuOpen] = useState(false);
   const [usedOnly, setUsedOnly] = useState(false);
@@ -1024,7 +1048,7 @@ export function AssetsPanel() {
   // which threw away the narrowing the user had just done by hand; opening a
   // folder is the cheapest way there is to say "only these". Browsing the root
   // still searches everything, because there the two are the same thing.
-  const searching = query.trim().length > 0 || usedOnly || typeId !== "all";
+  const searching = deferredQuery.trim().length > 0 || usedOnly || typeId !== "all";
   // An empty scan means it failed, not that the folder is empty — a folder
   // that is open always has at least its own contents. Falling back to the
   // folder listing keeps a failed scan showing *something* filterable instead
@@ -1049,7 +1073,7 @@ export function AssetsPanel() {
         searching
           ? filterEntries(pool, {
               typeId,
-              query,
+              query: deferredQuery,
               usedPaths: usedOnly ? usedPaths : null,
               getMeta: getAssetMeta,
             })
@@ -1059,7 +1083,7 @@ export function AssetsPanel() {
         sizeOf,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pool, searching, typeId, query, usedOnly, usedPaths, flagVersion, metaVersion, sort, sizeOf],
+    [pool, searching, typeId, deferredQuery, usedOnly, usedPaths, flagVersion, metaVersion, sort, sizeOf],
   );
   const selectedEntries = useMemo(
     () => visible.filter((e) => assetPaths.includes(e.path)),
@@ -1241,8 +1265,19 @@ export function AssetsPanel() {
   // "reveal" silently does nothing.
   const revealToken = useAssetRevealStore((s) => s.token);
   const revealPath = useAssetRevealStore((s) => s.path);
+  // Tracks which revealToken we've already moved keyboard focus to. The
+  // effect re-runs on every keystroke (because `visible` changes with the
+  // search box), so without this guard the grid would steal focus from the
+  // assets search input on every character. Only the first run for a given
+  // token is allowed to grab focus; subsequent runs still scroll/clear
+  // filters but leave focus alone. Reset when the store clears so a future
+  // reveal can focus again.
+  const focusedRevealTokenRef = useRef(null);
   useEffect(() => {
-    if (!revealPath) return;
+    if (!revealPath) {
+      focusedRevealTokenRef.current = null;
+      return;
+    }
     if (filtersActive && !visible.some((entry) => samePath(entry.path, revealPath))) {
       clearFilters();
       return;
@@ -1255,8 +1290,12 @@ export function AssetsPanel() {
     // keyboard (quick search). Taking focus here is what makes the follow-up
     // Enter open the file; `preventScroll` because the line above already
     // decided where the grid should sit.
-    if (useAssetRevealStore.getState().focus) {
+    if (
+      useAssetRevealStore.getState().focus &&
+      focusedRevealTokenRef.current !== revealToken
+    ) {
       gridRef.current?.focus({ preventScroll: true });
+      focusedRevealTokenRef.current = revealToken;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [revealToken, revealPath, visible]);

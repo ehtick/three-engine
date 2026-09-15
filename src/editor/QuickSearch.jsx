@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   ChevronDown,
@@ -70,6 +70,12 @@ function ResultIcon({ type }) {
 export function QuickSearch() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  // The Ctrl+F input is bound directly to `query` so every keystroke paints
+  // immediately; the parsed query, the results memo, and the matcher closures
+  // all consume `deferredQuery`, which React is allowed to lag behind by a
+  // frame. Without this the synchronous `pool.filter(...)` over entities +
+  // projectAssets freezes the box whenever the project is non-trivial.
+  const deferredQuery = useDeferredValue(query);
   const [active, setActive] = useState(0);
   const [projectAssets, setProjectAssets] = useState([]);
   const inputRef = useRef(null);
@@ -86,7 +92,7 @@ export function QuickSearch() {
   const metaVersion = useAssetMetaStore((s) => s.version);
   // Parsed once per keystroke (parseQuery memoizes per raw string), so the
   // structured gate and the warm-up below share one parse.
-  const parsed = useMemo(() => parseQuery(query), [query]);
+  const parsed = useMemo(() => parseQuery(deferredQuery), [deferredQuery]);
   const needs = useMemo(() => queryNeeds(parsed), [parsed]);
 
   useEffect(() => {
@@ -220,7 +226,7 @@ export function QuickSearch() {
   }, [entities, projectAssets]);
 
   const results = useMemo(() => {
-    const q = query.trim();
+    const q = deferredQuery.trim();
     if (!q) {
       // Empty box: recent searches first — they are the fastest thing to want
       // and the only rows here that mean "run this query again". The browse
@@ -294,7 +300,7 @@ export function QuickSearch() {
       .sort((a, b) => b.rank - a.rank || a.item.title.localeCompare(b.item.title))
       .slice(0, 60)
       .map((x) => x.item);
-  }, [allItems, mirrorById, entryByPath, query, parsed, recents, metaVersion]);
+  }, [allItems, mirrorById, entryByPath, deferredQuery, parsed, recents, metaVersion]);
 
   useEffect(() => setActive((value) => Math.min(value, Math.max(0, results.length - 1))), [results.length]);
 

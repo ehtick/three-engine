@@ -76,7 +76,14 @@ export class ViewFrustum {
     camera.updateMatrixWorld();
     _scratchInverse.copy(camera.matrixWorld).invert();
     _scratchViewProj.multiplyMatrices(camera.projectionMatrix, _scratchInverse);
-    this.frustum.setFromProjectionMatrix(_scratchViewProj);
+    // Without the camera's convention three assumes WebGL NDC; under a
+    // reversed depth buffer that frustum has no real far plane (everything
+    // past the camera's far counts as in view). Same call as viewCullingStats.
+    this.frustum.setFromProjectionMatrix(
+      _scratchViewProj,
+      camera.coordinateSystem ?? THREE.WebGLCoordinateSystem,
+      camera.reversedDepth === true,
+    );
     return true;
   }
 

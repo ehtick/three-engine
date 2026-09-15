@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useDeferredValue, useEffect, useState } from "react";
 import { Search, X } from "../icons/index.jsx";
 import { isBuiltinMaterial, WATER_MATERIAL_PATH } from "../../engine/builtinMaterials.js";
 import { useProjectStore } from "../store/projectStore.js";
@@ -36,6 +36,13 @@ export function AssetPicture({ path, glyphSize = 26 }) {
 export function AssetBrowser({ anchorRef, exts, value, emptyLabel = "None", layer = null, onPick, onClose }) {
   const [options, setOptions] = useState(null);
   const [query, setQuery] = useState("");
+  // The asset search input binds to `query` so every keystroke paints
+  // immediately; the full-path substring filter over `options` consumes
+  // `deferredQuery`. A material slot in a heavy project can list thousands
+  // of textures, and the picker can be re-opened many times per inspector.
+  // Enter-to-pick still reads `query` so picking the highlighted match on a
+  // partially-typed input never loses the just-typed character.
+  const deferredQuery = useDeferredValue(query);
   const rootPath = useProjectStore((s) => s.rootPath);
 
   useEffect(() => {
@@ -55,7 +62,7 @@ export function AssetBrowser({ anchorRef, exts, value, emptyLabel = "None", laye
 
   // Matching on the whole project-relative path, not only the name: the
   // folder someone organised by is also a way to find things.
-  const needle = query.trim().toLowerCase();
+  const needle = deferredQuery.trim().toLowerCase();
   const matches = needle ? (options ?? []).filter((path) => path.toLowerCase().includes(needle)) : options;
   const nameOf = (path) => (isBuiltinMaterial(path) ? "Water (built-in)" : fileName(path));
 

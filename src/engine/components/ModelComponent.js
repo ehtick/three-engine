@@ -1,15 +1,10 @@
 // @ts-check
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
-import { resolveAssetUrl } from "../assetResolver.js";
 import { loadMaterialAsset } from "../materialAsset.js";
-import { getGltfLoader, rebaseClipToZero } from "../gltfLoader.js";
+import { acquireModelAsset, releaseModelAsset, instantiateModel } from "../modelAsset.js";
 import { invalidateEntityBounds } from "../viewFrustum.js";
 import { applyCastShadow } from "../shadowMerge.js";
-
-// Draco-enabled shared loader: Draco-compressed .glb (from the draco module)
-// decode transparently; plain .glb are unaffected.
-const loader = getGltfLoader();
 
 export class ModelComponent extends Component {
   static type = "model";
@@ -36,6 +31,7 @@ export class ModelComponent extends Component {
 
   onAttach() {
     this.root = null;
+    this.template = null; // borrowed parse from modelAsset.js; owns geometry/materials/textures
     this.clips = [];
     this.skeletonBindings = [];
     this.unsubSkeletonSync = null;
@@ -57,29 +53,28 @@ export class ModelComponent extends Component {
 
   async #load(path, generation) {
     try {
-      const url = await resolveAssetUrl(path);
-      const gltf = await loader.loadAsync(url);
-      if (generation !== this.generation) return; // detached/reloaded meanwhile
-      this.root = gltf.scene;
+      // One parse per GLB path, shared by every entity (see modelAsset.js).
+      const template = await acquireModelAsset(path);
+      if (generation !== this.generation) {
+        releaseModelAsset(template); // detached/reloaded meanwhile
+        return;
+      }
+      this.template = template;
+      // Clips come pre-rebased (master-timeline exports) and are shared;
+      // the array is this entity's own.
+      const { root, clips } = instantiateModel(template);
+      this.root = root;
       // Commit the model atomically after overrides. Large GLBs otherwise show
       // bare geometry first and repaint one material at a time while GI sees a
       // half-authored scene.
       this.root.visible = false;
-      // Rebase clips exported from a shared master timeline (keyframes not
-      // starting at t=0) so they actually play instead of holding one pose.
-      this.clips = (gltf.animations ?? []).map(rebaseClipToZero);
+      this.clips = clips;
       this.root.userData.entityId = this.entity.id;
       this.root.traverse((obj) => {
         obj.userData.entityId = this.entity.id;
         if (obj.isMesh) {
           applyCastShadow(obj, this.props.castShadow !== false, this.entity.engine);
           obj.receiveShadow = this.props.receiveShadow !== false;
-          // Provenance for derived-data sidecars (e.g. baked mesh SDFs):
-          // GLB-internal geometries have no asset path of their own, so
-          // consumers key persisted artifacts off the model file instead.
-          if (obj.geometry && !obj.geometry.userData.sourceModelPath) {
-            obj.geometry.userData.sourceModelPath = path;
-          }
         }
       });
       this.entity.object3D.add(this.root);
@@ -181,7 +176,8 @@ export class ModelComponent extends Component {
         const shared = paths[index] ? resolved.get(paths[index]) : null;
         if (!shared) return material;
         this.sharedMaterials.add(shared);
-        if (material && material !== shared && !this.sharedMaterials.has(material)) material.dispose();
+        // Never dispose the GLB material here: it belongs to the cached
+        // template, and other instances of this model still render it.
         return shared;
       });
       mesh.material = array ? replaced : replaced[0];
@@ -194,18 +190,14 @@ export class ModelComponent extends Component {
     this.unsubSkeletonSync?.();
     this.unsubSkeletonSync = null;
     this.skeletonBindings = [];
-    if (!this.root) return;
-    this.entity.object3D.remove(this.root);
-    this.root.traverse((obj) => {
-      obj.geometry?.dispose();
-      const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
-      for (const mat of materials) {
-        if (mat && !this.sharedMaterials.has(mat)) mat.dispose();
-      }
-    });
+    if (this.root) this.entity.object3D.remove(this.root);
     this.root = null;
     this.clips = [];
-    this.sharedMaterials.clear();
+    this.sharedMaterials?.clear();
+    // Geometry, GLB materials and their textures are the template's; the cache
+    // disposes them (textures included) when the last instance releases.
+    if (this.template) releaseModelAsset(this.template);
+    this.template = null;
   }
 
   onDisable() {

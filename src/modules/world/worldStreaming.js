@@ -6,6 +6,7 @@ import { rockLibraryStepsFor, variantGeometry, createRockMaterial } from '../ter
 import { placeRocks } from '../../engine/rocks/rockPlacement.js';
 import { instanceScale } from '../../engine/rocks/rockLibrary.js';
 import { stableInstanceCapacity } from '../../engine/instanceCapacity.js';
+import { InstanceBatch } from './worldInstanceBatch.js';
 
 /**
  * ⚡ ROCK DISTANCE LODS (09-14, Complex scene). Every streamed stone drew its
@@ -174,6 +175,101 @@ function groundGeometry(data) {
   return geometry;
 }
 
+const rockMatrix = new THREE.Matrix4(), rockRotation = new THREE.Quaternion(), rockPosition = new THREE.Vector3(), rockScale = new THREE.Vector3(), rockUp = new THREE.Vector3(0, 1, 0);
+
+/**
+ * ⚡ STREAMED STONE AS TWO DRAWS (09-14, Complex scene): one InstancedMesh per
+ * `kind:variant:LOD` was ~29 render objects per pass, none ever culled (each
+ * bound spanned the streamed area). Now every variant × LOD is one geometry range
+ * in a batch — one batch that casts (LOD ≤ ROCK_SHADOW_MAX_LOD), one that does
+ * not, since castShadow is per object — and three culls per stone against the
+ * camera of each pass (worldInstanceBatch.js). The re-bucket is the old one; a
+ * stone keeps its instance id while it stays in its batch, so a walk only moves
+ * the stones whose LOD crossed a ring. No `shadowCasterRange` is published, so
+ * the CSM per-cascade filter never drops a batch for its area-wide bound.
+ * `__worldRockBatches = false` (read when a streamer is built) keeps the InstancedMeshes.
+ */
+export class RockBatches {
+  constructor(group, material, library) {
+    // Pre-sized from the whole library: every variant × LOD fits without growth.
+    const cast = { vertices: 0, indices: 0 }, flat = { vertices: 0, indices: 0 };
+    for (const list of Object.values(library.variants)) for (const variant of list) {
+      for (let lod = 0; lod <= (variant.lods?.length ?? 0); lod++) {
+        const mesh = rockLodMesh(variant, lod), size = lod <= ROCK_SHADOW_MAX_LOD ? cast : flat;
+        size.vertices += mesh.positions.length / 3; size.indices += mesh.indices.length;
+      }
+    }
+    this.cast = new InstanceBatch({ group, material, name: 'World streamed stone · casts', castShadow: true, ...cast });
+    this.flat = new InstanceBatch({ group, material, name: 'World streamed stone', castShadow: false, ...flat });
+    this.geometries = new Map(); // `kind:index:lod` → { batch, id, variant, lod }
+    this.instances = new Map(); // placement → { entry, id }
+  }
+
+  /** `buckets` from the re-bucket: `kind:index:lod` → { variant, lod, items }. */
+  update(buckets, palette) {
+    const next = new Map();
+    for (const [key, bucket] of buckets) for (const placement of bucket.items) next.set(placement, { key, bucket });
+    // Leavers and batch changes first, so the adds below reuse their ids.
+    for (const [placement, record] of this.instances) {
+      const want = next.get(placement);
+      if (want && this.#batchOf(want.bucket.lod) === record.entry.batch) continue;
+      record.entry.batch.remove(record.id);
+      this.instances.delete(placement);
+    }
+    for (const [placement, { key, bucket }] of next) {
+      const entry = this.#geometry(key, bucket, palette), record = this.instances.get(placement);
+      if (record) {
+        // Same batch, other LOD: only the geometry range changes.
+        if (record.entry !== entry) { entry.batch.setGeometryIdAt(record.id, entry.id); record.entry = entry; }
+        continue;
+      }
+      const [sx, sy, sz] = instanceScale(placement, bucket.variant);
+      rockMatrix.compose(rockPosition.fromArray(placement.position), rockRotation.setFromAxisAngle(rockUp, placement.yaw), rockScale.set(sx, sy, sz));
+      this.instances.set(placement, { entry, id: entry.batch.add(entry.id, rockMatrix) });
+    }
+    // As before: a variant with nothing loaded gives its geometry back; one with
+    // another LOD still loaded keeps every LOD, so ring crossings never re-upload.
+    const loaded = new Set([...buckets.keys()].map(key => key.slice(0, key.lastIndexOf(':'))));
+    for (const [key, entry] of this.geometries) {
+      if (loaded.has(key.slice(0, key.lastIndexOf(':')))) continue;
+      entry.batch.deleteGeometry(entry.id);
+      this.geometries.delete(key);
+    }
+    this.cast.flush(); this.flat.flush();
+  }
+
+  /** New palette: every loaded range recoloured in place, instances untouched. */
+  recolor(palette) {
+    for (const entry of this.geometries.values()) {
+      const geometry = variantGeometry(rockLodMesh(entry.variant, entry.lod), palette);
+      entry.batch.setGeometryAt(entry.id, geometry);
+      geometry.dispose();
+    }
+  }
+
+  get draws() { return (this.cast.live ? 1 : 0) + (this.flat.live ? 1 : 0); }
+
+  bytes() { return this.cast.bytes() + this.flat.bytes(); }
+
+  dispose() {
+    this.cast.dispose(); this.flat.dispose();
+    this.geometries.clear(); this.instances.clear();
+  }
+
+  #batchOf(lod) { return lod <= ROCK_SHADOW_MAX_LOD ? this.cast : this.flat; }
+
+  #geometry(key, { variant, lod }, palette) {
+    let entry = this.geometries.get(key);
+    if (!entry) {
+      const batch = this.#batchOf(lod), geometry = variantGeometry(rockLodMesh(variant, lod), palette);
+      entry = { batch, id: batch.addGeometry(geometry), variant, lod };
+      geometry.dispose();
+      this.geometries.set(key, entry);
+    }
+    return entry;
+  }
+}
+
 export class WorldStreamer {
   constructor({ parent, landscape, chunkSize = 128, radius = 1024, exclude = 0, bounds = Infinity, rockRadius = 384, plantRadius = 420, lodDistances = null,
     physics = null, physicsRadius = 160, memoryBudget = 512 * MiB, plants = null, style = 'natural', settlements = null, buildings = null, buildingRadius = 900 }) {
@@ -217,6 +313,9 @@ export class WorldStreamer {
     this.librarySteps = landscape.options.rocks > 0 ? rockLibraryStepsFor(landscape, 3, this.clock) : null;
     this.rockMeshes = new Map();
     this.rockGeometries = new Map();
+    // Built with the library (it pre-sizes from it); null on the InstancedMesh path.
+    this.rockBatching = globalThis.__worldRockBatches !== false;
+    this.rocks = null;
     this.rockBytes = 0;
     this.rocksDirty = false;
     this.lastRockBuild = -Infinity;
@@ -263,7 +362,7 @@ export class WorldStreamer {
       this.#commit(this.job, result.value);
       this.job = this.#nextJob();
     }
-    if (this.rockViewer && this.rockMeshes.size && Math.hypot(x - this.rockViewer[0], z - this.rockViewer[1]) > ROCK_LOD_STEP) this.rocksDirty = true;
+    if (this.rockViewer && (this.rockMeshes.size || this.rocks?.instances.size) && Math.hypot(x - this.rockViewer[0], z - this.rockViewer[1]) > ROCK_LOD_STEP) this.rocksDirty = true;
     if (this.rocksDirty && this.library && performance.now() - this.lastRockBuild > 250) this.#rebuildRocks(x, z);
     this.ground?.flush();
     if (this.buildings) {
@@ -285,6 +384,7 @@ export class WorldStreamer {
     this.landscape = Object.freeze({ ...this.landscape, palette: { ...palette } });
     for (const tile of this.tiles.values()) tile.stale = true;
     if (this.job?.layer === 'ground') this.job = null;
+    if (this.rocks) { this.rocks.recolor(this.landscape.palette); return true; }
     for (const entry of this.rockMeshes.values()) { entry.mesh.removeFromParent(); entry.mesh.dispose(); }
     this.rockMeshes.clear();
     for (const geometry of this.rockGeometries.values()) geometry.dispose();
@@ -332,7 +432,7 @@ export class WorldStreamer {
     }
     return {
       tiles: this.tiles.size, desired: this.desired.length, pending: this.pending, triangles, rocks,
-      rockDraws: [...this.rockMeshes.values()].filter(entry => entry.mesh.count > 0).length,
+      rockDraws: this.rocks ? this.rocks.draws : [...this.rockMeshes.values()].filter(entry => entry.mesh.count > 0).length,
       waterChunks, waterTriangles, plantChunks, plants, overBudget: this.overBudget,
       buildings: this.buildings?.count ?? 0, hamlets: this.settlements?.plans().length ?? 0,
       inView: this.desired.filter(want => want.inView).length, memory: this.memory(),
@@ -558,6 +658,12 @@ export class WorldStreamer {
       if (!buckets.has(key)) buckets.set(key, { variant, lod, items: [] });
       buckets.get(key).items.push(placement);
     }
+    if (this.rockBatching) {
+      this.rocks ??= new RockBatches(this.group, this.rockMaterial, library);
+      this.rocks.update(buckets, this.landscape.palette);
+      this.rockBytes = this.rocks.bytes();
+      return;
+    }
     const matrix = new THREE.Matrix4(), rotation = new THREE.Quaternion(), position = new THREE.Vector3(), scale = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
     for (const [key, { variant, lod, items }] of buckets) {
       let entry = this.rockMeshes.get(key);
@@ -619,6 +725,7 @@ export class WorldStreamer {
     }
     this.tiles.clear();
     this.ground?.dispose();
+    this.rocks?.dispose(); this.rocks = null;
     for (const entry of this.rockMeshes.values()) { entry.mesh.removeFromParent(); entry.mesh.dispose(); }
     this.rockMeshes.clear();
     for (const geometry of this.rockGeometries.values()) geometry.dispose();

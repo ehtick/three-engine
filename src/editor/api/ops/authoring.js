@@ -207,7 +207,7 @@ defineOp({
       type: "object",
       required: true,
       description:
-        "Any of: background, ambientColor, ambientIntensity, environment{cubemap,background,lighting,intensity,rotation,blur}, fog{type,color,near,far,density}, wind{vector,gust,gustFrequency}, toneMapping, exposure, shadow{...}, renderer{...}, performance{maxDevicePixelRatio,renderScale,dynamicResolution,targetFps,volumeStepScale,autoBatching,staticMerging,occlusionCulling}. Nested blocks are merged key-by-key, so passing one performance knob keeps the rest. Call scene.getSettings first to see the current shape.",
+        "Any of: background, ambientColor, ambientIntensity, environment{cubemap,background,lighting,intensity,rotation,blur}, fog{type,color,near,far,density}, wind{vector,gust,gustFrequency}, toneMapping, exposure, shadow{...}, renderer{antialias,samples,transparent,reversedDepth} (each rebuilds the renderer; reversedDepth = far-range depth precision for km-scale scenes), performance{maxDevicePixelRatio,renderScale,dynamicResolution,targetFps,volumeStepScale,autoBatching,staticMerging,occlusionCulling}. Nested blocks are merged key-by-key, so passing one performance knob keeps the rest. Call scene.getSettings first to see the current shape.",
     },
     label: { type: "string", default: "Change scene settings", description: "Undo-menu label." },
   },

@@ -63,30 +63,43 @@ export function mipmapBlitter(renderer) {
   if (blitter) return blitter;
   const module = device.createShaderModule({ code: SHADER, label: "water mip blit" });
   const computeModule = device.createShaderModule({ code: COMPUTE_SHADER, label: "water mip compute" });
-  let computePipeline = null;
   const sampler = device.createSampler({ minFilter: "linear", magFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" });
-  const pipelines = new Map();   // format → pipeline
-  const caches = new WeakMap();  // GPUTexture → { passes }
-  const pipelineFor = (format) => {
-    let pipeline = pipelines.get(format);
-    if (!pipeline) {
-      pipeline = device.createRenderPipeline({
-        label: `water mip blit ${format}`, layout: "auto",
-        vertex: { module, entryPoint: "vs" },
-        fragment: { module, entryPoint: "fs", targets: [{ format }] },
-        primitive: { topology: "triangle-list" },
-      });
-      pipelines.set(format, pipeline);
-    }
-    return pipeline;
+  const pipelineStates = new Map();   // format → { pipeline, promise }
+  const caches = new WeakMap();       // GPUTexture → { passes | dispatches, pipeline }
+  // ⚠ SYNC `create*Pipeline` IS A KNOWN GPU-PROCESS STALL SOURCE. Both
+  // pipelines are built async, on first use; a texture whose pipeline isn't
+  // ready yet just keeps its previous frame's mips (`cacheFor` returns null,
+  // `encode` skips it) — one frame of stale mips is fine for water.
+  const computeState = { pipeline: null, promise: null };
+  const ensureComputePipeline = () => {
+    if (computeState.pipeline) return computeState.pipeline;
+    computeState.promise ??= device.createComputePipelineAsync({
+      label: "water mip compute", layout: "auto", compute: { module: computeModule, entryPoint: "cs" },
+    }).then((pipeline) => { computeState.pipeline = pipeline; })
+      .catch((error) => { console.error("[water] mip compute pipeline failed", error); computeState.promise = null; });
+    return null;
+  };
+  const ensureRenderPipeline = (format) => {
+    let state = pipelineStates.get(format);
+    if (!state) { state = { pipeline: null, promise: null }; pipelineStates.set(format, state); }
+    if (state.pipeline) return state.pipeline;
+    state.promise ??= device.createRenderPipelineAsync({
+      label: `water mip blit ${format}`, layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: { module, entryPoint: "fs", targets: [{ format }] },
+      primitive: { topology: "triangle-list" },
+    }).then((pipeline) => { state.pipeline = pipeline; })
+      .catch((error) => { console.error(`[water] mip blit pipeline failed (${format})`, error); state.promise = null; });
+    return null;
   };
   const cacheFor = (gpuTexture) => {
     let cache = caches.get(gpuTexture);
     if (cache) return cache;
     // A storage array of rgba16float: the compute path.
     if ((gpuTexture.usage & GPUTextureUsage.STORAGE_BINDING) && gpuTexture.format === "rgba16float" && gpuTexture.depthOrArrayLayers > 1) {
-      computePipeline ??= device.createComputePipeline({ label: "water mip compute", layout: "auto", compute: { module: computeModule, entryPoint: "cs" } });
-      const layout = computePipeline.getBindGroupLayout(0);
+      const pipeline = ensureComputePipeline();
+      if (!pipeline) return null;   // still compiling — try again next frame
+      const layout = pipeline.getBindGroupLayout(0);
       const dispatches = [];
       for (let level = 1; level < gpuTexture.mipLevelCount; level++) {
         const view = (mip) => gpuTexture.createView({ dimension: "2d-array", baseMipLevel: mip, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: gpuTexture.depthOrArrayLayers });
@@ -94,11 +107,12 @@ export function mipmapBlitter(renderer) {
         const w = Math.max(1, gpuTexture.width >> level), h = Math.max(1, gpuTexture.height >> level);
         dispatches.push({ bindGroup, groups: [Math.ceil(w / 8), Math.ceil(h / 8), gpuTexture.depthOrArrayLayers] });
       }
-      cache = { dispatches };
+      cache = { dispatches, pipeline };
       caches.set(gpuTexture, cache);
       return cache;
     }
-    const pipeline = pipelineFor(gpuTexture.format);
+    const pipeline = ensureRenderPipeline(gpuTexture.format);
+    if (!pipeline) return null;   // still compiling — try again next frame
     const layout = pipeline.getBindGroupLayout(0);
     const passes = [];
     for (let layer = 0; layer < gpuTexture.depthOrArrayLayers; layer++) {
@@ -112,31 +126,59 @@ export function mipmapBlitter(renderer) {
     caches.set(gpuTexture, cache);
     return cache;
   };
+  // A resolved cache's passes/dispatches, encoded into an already-open
+  // encoder — the shared body behind both `generate` (one texture) and
+  // `generateMany` (several textures, one encoder, one submit).
+  const encodeCache = (encoder, cache) => {
+    if (cache.dispatches) {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(cache.pipeline);
+      for (const { bindGroup, groups } of cache.dispatches) { pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(groups[0], groups[1], groups[2]); }
+      pass.end();
+      return;
+    }
+    for (const { pipeline, bindGroup, target } of cache.passes ?? []) {
+      const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(3);
+      pass.end();
+    }
+  };
+  // A texture ready to encode this frame, or `null` (no mips, missing GPU
+  // texture, or its pipeline is still compiling async).
+  const readyCache = (texture) => {
+    if (!texture) return null;
+    const gpuTexture = backend.get(texture)?.texture;
+    if (!gpuTexture || gpuTexture.mipLevelCount <= 1) return null;
+    return cacheFor(gpuTexture);
+  };
+  const readyScratch = [];   // reused by `generateMany`, cleared every call
   blitter = {
     /** Regenerate every mip of `texture` (a three texture the backend has created) from its level 0. */
     generate(texture) {
-      const gpuTexture = backend.get(texture)?.texture;
-      if (!gpuTexture || gpuTexture.mipLevelCount <= 1) return false;
-      const cache = cacheFor(gpuTexture);
-      if (cache.dispatches) {
-        const encoder = device.createCommandEncoder({ label: "water mips (compute)" });
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(computePipeline);
-        for (const { bindGroup, groups } of cache.dispatches) { pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(...groups); }
-        pass.end();
-        device.queue.submit([encoder.finish()]);
-        return true;
-      }
-      const { passes } = cache;
-      if (!passes.length) return false;
+      const cache = readyCache(texture);
+      if (!cache) return false;
       const encoder = device.createCommandEncoder({ label: "water mips" });
-      for (const { pipeline, bindGroup, target } of passes) {
-        const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bindGroup);
-        pass.draw(3);
-        pass.end();
-      }
+      encodeCache(encoder, cache);
+      device.queue.submit([encoder.finish()]);
+      return true;
+    },
+    /**
+     * Regenerate every mip of every texture in `textures` (three textures the
+     * backend has created; falsy entries skipped) — ONE encoder and ONE
+     * `queue.submit` for the whole batch, rather than one of each per texture.
+     * The sea calls this with its three maps every frame.
+     */
+    generateMany(textures) {
+      if (!textures || !textures.length) return false;
+      // Resolve every cache BEFORE opening an encoder: a still-compiling
+      // pipeline must not leave a half-finished, never-submitted encoder.
+      readyScratch.length = 0;
+      for (const texture of textures) { const cache = readyCache(texture); if (cache) readyScratch.push(cache); }
+      if (!readyScratch.length) return false;
+      const encoder = device.createCommandEncoder({ label: "water mips (batch)" });
+      for (const cache of readyScratch) encodeCache(encoder, cache);
       device.queue.submit([encoder.finish()]);
       return true;
     },

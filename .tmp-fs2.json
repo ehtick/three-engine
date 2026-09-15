@@ -1,0 +1,836 @@
+{
+  "components": [
+    {
+      "entity": "0SE6waSo17/world/foliage/oak-wide",
+      "name": "oak-wide",
+      "species": "oak",
+      "lodNear": 45,
+      "lodFar": 135,
+      "maxDistance": 420,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 40,
+      "impostorSources": 40,
+      "impostorSourceInstances": 89,
+      "totalInstances": 89,
+      "levels": {
+        "0": 8,
+        "1": 31,
+        "2": 1
+      },
+      "tierMasks": {
+        "2": 5,
+        "3": 12,
+        "6": 21,
+        "7": 2
+      },
+      "commitMasks": {
+        "2": 5,
+        "3": 12,
+        "6": 21,
+        "7": 2
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 1626,
+      "commitVersion": 1626,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 34,
+          "castShadow": true
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 89,
+          "castShadow": true
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": true
+        }
+      ],
+      "stats": {
+        "instances": 89,
+        "chunks": 40,
+        "drawCalls": 3,
+        "triangles": 743636,
+        "nearChunks": 8,
+        "midChunks": 31,
+        "impostorChunks": 1,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 22,
+        "vertices": 1007521
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/oak-elder",
+      "name": "oak-elder",
+      "species": "oak",
+      "lodNear": 45,
+      "lodFar": 135,
+      "maxDistance": 420,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 34,
+      "impostorSources": 34,
+      "impostorSourceInstances": 82,
+      "totalInstances": 82,
+      "levels": {
+        "0": 8,
+        "1": 26
+      },
+      "tierMasks": {
+        "2": 1,
+        "3": 12,
+        "6": 18,
+        "7": 3
+      },
+      "commitMasks": {
+        "2": 1,
+        "3": 12,
+        "6": 18,
+        "7": 3
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 1378,
+      "commitVersion": 1378,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 37,
+          "castShadow": true
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 82,
+          "castShadow": true
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": true
+        }
+      ],
+      "stats": {
+        "instances": 82,
+        "chunks": 34,
+        "drawCalls": 3,
+        "triangles": 683688,
+        "nearChunks": 8,
+        "midChunks": 26,
+        "impostorChunks": 0,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 24,
+        "vertices": 931032
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/birch-tall",
+      "name": "birch-tall",
+      "species": "birch",
+      "lodNear": 45,
+      "lodFar": 135,
+      "maxDistance": 420,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 22,
+      "impostorSources": 22,
+      "impostorSourceInstances": 37,
+      "totalInstances": 37,
+      "levels": {
+        "0": 2,
+        "1": 20
+      },
+      "tierMasks": {
+        "2": 8,
+        "3": 3,
+        "6": 11
+      },
+      "commitMasks": {
+        "2": 8,
+        "3": 3,
+        "6": 11
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 849,
+      "commitVersion": 849,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 4,
+          "castShadow": true
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 37,
+          "castShadow": true
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": true
+        }
+      ],
+      "stats": {
+        "instances": 37,
+        "chunks": 22,
+        "drawCalls": 3,
+        "triangles": 185760,
+        "nearChunks": 2,
+        "midChunks": 20,
+        "impostorChunks": 0,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 24,
+        "vertices": 297514
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/pine-tall",
+      "name": "pine-tall",
+      "species": "pine",
+      "lodNear": 45,
+      "lodFar": 135,
+      "maxDistance": 420,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 22,
+      "impostorSources": 22,
+      "impostorSourceInstances": 32,
+      "totalInstances": 32,
+      "levels": {
+        "0": 3,
+        "1": 18,
+        "2": 1
+      },
+      "tierMasks": {
+        "2": 7,
+        "3": 4,
+        "6": 11
+      },
+      "commitMasks": {
+        "2": 7,
+        "3": 4,
+        "6": 11
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 912,
+      "commitVersion": 912,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 6,
+          "castShadow": true
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 32,
+          "castShadow": true
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": true
+        }
+      ],
+      "stats": {
+        "instances": 32,
+        "chunks": 22,
+        "drawCalls": 3,
+        "triangles": 153942,
+        "nearChunks": 3,
+        "midChunks": 18,
+        "impostorChunks": 1,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 24,
+        "vertices": 250810
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/hazel-study",
+      "name": "hazel-study",
+      "species": "oak",
+      "lodNear": 30,
+      "lodFar": 90,
+      "maxDistance": 220,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 154,
+      "impostorSources": 154,
+      "impostorSourceInstances": 469,
+      "totalInstances": 469,
+      "levels": {
+        "0": 20,
+        "1": 93,
+        "2": 41
+      },
+      "tierMasks": {
+        "1": 1,
+        "2": 20,
+        "3": 27,
+        "4": 7,
+        "6": 93,
+        "7": 6
+      },
+      "commitMasks": {
+        "1": 1,
+        "2": 20,
+        "3": 27,
+        "4": 7,
+        "6": 93,
+        "7": 6
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 7413,
+      "commitVersion": 7413,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [
+        {
+          "lod": 0,
+          "cursor": 154,
+          "count": 115,
+          "done": true,
+          "chunksMatch": false
+        },
+        {
+          "lod": 1,
+          "cursor": 154,
+          "count": 453,
+          "done": true,
+          "chunksMatch": false
+        },
+        {
+          "lod": 2,
+          "cursor": 154,
+          "count": 362,
+          "done": true,
+          "chunksMatch": false
+        }
+      ],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 115,
+          "castShadow": true
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 453,
+          "castShadow": true
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": true
+        }
+      ],
+      "stats": {
+        "instances": 469,
+        "chunks": 154,
+        "drawCalls": 3,
+        "triangles": 1568412,
+        "nearChunks": 20,
+        "midChunks": 93,
+        "impostorChunks": 41,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 12,
+        "vertices": 1750135
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/young-growth",
+      "name": "young-growth",
+      "species": "birch",
+      "lodNear": 30,
+      "lodFar": 90,
+      "maxDistance": 220,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 79,
+      "impostorSources": 79,
+      "impostorSourceInstances": 139,
+      "totalInstances": 139,
+      "levels": {
+        "0": 9,
+        "1": 49,
+        "2": 21
+      },
+      "tierMasks": {
+        "1": 2,
+        "2": 10,
+        "3": 14,
+        "4": 5,
+        "6": 48
+      },
+      "commitMasks": {
+        "1": 2,
+        "2": 10,
+        "3": 14,
+        "4": 5,
+        "6": 48
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 4063,
+      "commitVersion": 4063,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [
+        {
+          "lod": 0,
+          "cursor": 79,
+          "count": 44,
+          "done": true,
+          "chunksMatch": false
+        },
+        {
+          "lod": 1,
+          "cursor": 79,
+          "count": 130,
+          "done": true,
+          "chunksMatch": false
+        },
+        {
+          "lod": 2,
+          "cursor": 79,
+          "count": 85,
+          "done": true,
+          "chunksMatch": false
+        }
+      ],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 44,
+          "castShadow": true
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 130,
+          "castShadow": true
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": true
+        }
+      ],
+      "stats": {
+        "instances": 139,
+        "chunks": 79,
+        "drawCalls": 3,
+        "triangles": 596290,
+        "nearChunks": 9,
+        "midChunks": 49,
+        "impostorChunks": 21,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 12,
+        "vertices": 787256
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/meadow-flowers",
+      "name": "meadow-flowers",
+      "species": "wildflowers",
+      "lodNear": 30,
+      "lodFar": 90,
+      "maxDistance": 220,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 369,
+      "impostorSources": 369,
+      "impostorSourceInstances": 999,
+      "totalInstances": 999,
+      "levels": {
+        "0": 36,
+        "1": 214,
+        "2": 119
+      },
+      "tierMasks": {
+        "1": 17,
+        "2": 74,
+        "3": 44,
+        "4": 25,
+        "6": 209
+      },
+      "commitMasks": {
+        "1": 17,
+        "2": 73,
+        "3": 44,
+        "4": 25,
+        "6": 210
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 18025,
+      "commitVersion": 18024,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [
+        {
+          "lod": 0,
+          "cursor": 369,
+          "count": 176,
+          "done": true,
+          "chunksMatch": false
+        },
+        {
+          "lod": 1,
+          "cursor": 369,
+          "count": 929,
+          "done": true,
+          "chunksMatch": false
+        },
+        {
+          "lod": 2,
+          "cursor": 369,
+          "count": 689,
+          "done": true,
+          "chunksMatch": false
+        }
+      ],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 176,
+          "castShadow": false
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 929,
+          "castShadow": false
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": false
+        }
+      ],
+      "stats": {
+        "instances": 999,
+        "chunks": 369,
+        "drawCalls": 3,
+        "triangles": 249230,
+        "nearChunks": 36,
+        "midChunks": 214,
+        "impostorChunks": 119,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 6,
+        "vertices": 537520
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/bank-rushes",
+      "name": "bank-rushes",
+      "species": "grass",
+      "lodNear": 30,
+      "lodFar": 90,
+      "maxDistance": 220,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 64,
+      "impostorSources": 64,
+      "impostorSourceInstances": 587,
+      "totalInstances": 587,
+      "levels": {
+        "0": 11,
+        "1": 41,
+        "2": 12
+      },
+      "tierMasks": {
+        "1": 1,
+        "2": 9,
+        "3": 13,
+        "6": 41
+      },
+      "commitMasks": {
+        "1": 1,
+        "2": 8,
+        "3": 13,
+        "6": 42
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 3314,
+      "commitVersion": 3312,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [
+        {
+          "lod": 0,
+          "cursor": 64,
+          "count": 194,
+          "done": true,
+          "chunksMatch": false
+        },
+        {
+          "lod": 1,
+          "cursor": 64,
+          "count": 586,
+          "done": true,
+          "chunksMatch": false
+        },
+        {
+          "lod": 2,
+          "cursor": 64,
+          "count": 379,
+          "done": true,
+          "chunksMatch": false
+        }
+      ],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 194,
+          "castShadow": false
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 586,
+          "castShadow": false
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": false
+        }
+      ],
+      "stats": {
+        "instances": 587,
+        "chunks": 64,
+        "drawCalls": 3,
+        "triangles": 43990,
+        "nearChunks": 11,
+        "midChunks": 41,
+        "impostorChunks": 12,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 10.404,
+        "vertices": 131690
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/meadow",
+      "name": "meadow",
+      "species": "grass",
+      "lodNear": 20,
+      "lodFar": 130,
+      "maxDistance": 40,
+      "shadowFar": 0,
+      "status": "Drawn",
+      "chunks": 0,
+      "impostorSources": 0,
+      "impostorSourceInstances": 0,
+      "totalInstances": 0,
+      "levels": {},
+      "tierMasks": {},
+      "commitMasks": {},
+      "atlasReady": false,
+      "atlasError": null,
+      "impostorRamp": 0,
+      "batchDirty": false,
+      "batchVersion": 0,
+      "commitVersion": -1,
+      "tierEverCommitted": [
+        false,
+        false,
+        false
+      ],
+      "jobs": [],
+      "renderMeshes": [],
+      "stats": {
+        "instances": 384787,
+        "chunks": 3,
+        "drawCalls": 3,
+        "triangles": 1378347,
+        "nearChunks": 0,
+        "midChunks": 0,
+        "impostorChunks": 0,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Drawn",
+        "colliders": 0
+      }
+    },
+    {
+      "entity": "0SE6waSo17/world/foliage/accent",
+      "name": "accent",
+      "species": "oak",
+      "lodNear": 45,
+      "lodFar": 135,
+      "maxDistance": 420,
+      "shadowFar": 0,
+      "status": "Ready",
+      "chunks": 9,
+      "impostorSources": 9,
+      "impostorSourceInstances": 11,
+      "totalInstances": 11,
+      "levels": {
+        "0": 2,
+        "1": 7
+      },
+      "tierMasks": {
+        "2": 2,
+        "3": 4,
+        "6": 3
+      },
+      "commitMasks": {
+        "2": 2,
+        "3": 4,
+        "6": 3
+      },
+      "atlasReady": true,
+      "atlasError": null,
+      "impostorRamp": 1,
+      "batchDirty": false,
+      "batchVersion": 414,
+      "commitVersion": 414,
+      "tierEverCommitted": [
+        true,
+        true,
+        true
+      ],
+      "jobs": [],
+      "renderMeshes": [
+        {
+          "lod": 0,
+          "visible": true,
+          "count": 5,
+          "castShadow": true
+        },
+        {
+          "lod": 1,
+          "visible": true,
+          "count": 11,
+          "castShadow": true
+        },
+        {
+          "lod": 2,
+          "visible": true,
+          "count": 1,
+          "castShadow": true
+        }
+      ],
+      "stats": {
+        "instances": 11,
+        "chunks": 9,
+        "drawCalls": 3,
+        "triangles": 103452,
+        "nearChunks": 2,
+        "midChunks": 7,
+        "impostorChunks": 0,
+        "culledChunks": 0,
+        "impostorReady": true,
+        "status": "Ready",
+        "colliders": 0,
+        "effectiveCellSize": 24,
+        "vertices": 137772
+      }
+    }
+  ]
+}

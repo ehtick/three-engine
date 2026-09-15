@@ -202,9 +202,28 @@ export class PlanarReflectionComponent extends Component {
 
     const tint = new THREE.Color(props.tint ?? "#ffffff");
     const intensity = Math.max(0, props.intensity ?? 1);
+    // A GLB's materials are shared by every instance of that model
+    // (modelAsset.js), so patching one would put this mirror on all of them:
+    // swap in a private copy first, one per shared material, undone on detach.
+    this._swaps = [];
+    const privateCopies = new Map();
     for (const mesh of meshes) {
-      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      for (const material of materials) {
+      const isArray = Array.isArray(mesh.material);
+      const materials = isArray ? mesh.material : [mesh.material];
+      for (let index = 0; index < materials.length; index++) {
+        let material = materials[index];
+        if (material?.userData?.modelTemplate) {
+          let own = privateCopies.get(material);
+          if (!own) {
+            own = material.clone();
+            delete own.userData.modelTemplate;
+            privateCopies.set(material, own);
+          }
+          this._swaps.push({ mesh, index, isArray, original: material, own });
+          if (isArray) materials[index] = own;
+          else mesh.material = own;
+          material = own;
+        }
         if (!material || this._restore.some((entry) => entry.material === material)) continue;
         this.#applyTo(material, node, tint, intensity);
       }
@@ -289,6 +308,16 @@ export class PlanarReflectionComponent extends Component {
       entry.material.needsUpdate = true;
     }
     this._restore = [];
+    const disposed = new Set();
+    for (const { mesh, index, isArray, original, own } of this._swaps ?? []) {
+      if (isArray) mesh.material[index] = original;
+      else mesh.material = original;
+      if (!disposed.has(own)) {
+        disposed.add(own);
+        own.dispose();
+      }
+    }
+    this._swaps = [];
     this._target?.removeFromParent();
     this._target = null;
     // Frees the reflector's render target — without this every prop edit (which

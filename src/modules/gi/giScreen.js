@@ -6444,6 +6444,10 @@ export function blitBvhAtlasTiles(renderer, bvhScene) {
     renderer.setScissorTest(true);
     for (const { map, tileIndex, tint } of pending) {
       if (!isFlatTexture(map)) continue; // the relayed tile stands
+      // A tile outside the grid is a rect outside the target: SetScissorRect
+      // rejects it and invalidates the WHOLE command buffer (2026-09-14, the
+      // seated atlas indexed tiles by a 512-mesh table on a 144-tile grid).
+      if (!(tileIndex >= 0 && tileIndex < atlasGrid * atlasGrid)) continue;
       const tileX = (tileIndex % atlasGrid) * atlasTile;
       const tileY = Math.floor(tileIndex / atlasGrid) * atlasTile;
       rt.viewport.set(tileX, tileY, atlasTile, atlasTile);

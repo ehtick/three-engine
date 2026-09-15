@@ -854,22 +854,42 @@ export function giCompute(renderer, nodes, { deferrable = false } = {}) {
  * restores one pass per node for an A/B; `__giComputeGroupStats` counts calls
  * against nodes so `profile.frameStats` can show the ratio.
  */
-const giComputeGroupCache = new Map();
+// Keyed by the batch's FIRST NODE (an object identity, so a GI regeneration
+// that mints new node objects misses naturally — no explicit invalidation
+// needed) and then by length, instead of a `.map(...).join(",")` string built
+// fresh every flush (~32×/frame). A hit is still verified element-by-element
+// (cheap reference compares, no allocation) before reuse, so a same-length
+// batch that happens to start with the same node but differ further along
+// still rebuilds correctly — the cache can only make a hit faster, never wrong.
+const giComputeGroupCache = new Map();   // first node → Map<length, group>
 const GI_COMPUTE_GROUP_CACHE_MAX = 512;
 const GI_COMPUTE_GROUP_ID_BASE = 0x40000000;
 let giComputeGroupSeq = 0;
+let giComputeGroupCacheEntries = 0;
 const giComputeGroupStats = { calls: 0, nodes: 0, singles: 0, groups: 0, maxGroup: 0 };
 globalThis.__giComputeGroupStats = giComputeGroupStats;
 
+function giComputeGroupSame(group, batch) {
+  if (group.length !== batch.length) return false;
+  for (let i = 0; i < batch.length; i++) if (group[i] !== batch[i]) return false;
+  return true;
+}
+
 function giComputeGroupFor(batch) {
-  const key = batch.map((n) => n.id ?? n.uuid ?? n.name ?? "?").join(",");
-  let group = giComputeGroupCache.get(key);
-  if (!group) {
-    if (giComputeGroupCache.size >= GI_COMPUTE_GROUP_CACHE_MAX) giComputeGroupCache.clear();
-    group = batch.slice();
-    group.id = GI_COMPUTE_GROUP_ID_BASE + (giComputeGroupSeq++);
-    giComputeGroupCache.set(key, group);
+  const first = batch[0];
+  let byLength = giComputeGroupCache.get(first);
+  const cached = byLength?.get(batch.length);
+  if (cached && giComputeGroupSame(cached, batch)) return cached;
+  if (giComputeGroupCacheEntries >= GI_COMPUTE_GROUP_CACHE_MAX) {
+    giComputeGroupCache.clear();
+    giComputeGroupCacheEntries = 0;
+    byLength = null;
   }
+  if (!byLength) { byLength = new Map(); giComputeGroupCache.set(first, byLength); }
+  const group = batch.slice();
+  group.id = GI_COMPUTE_GROUP_ID_BASE + (giComputeGroupSeq++);
+  byLength.set(batch.length, group);
+  giComputeGroupCacheEntries++;
   return group;
 }
 
@@ -878,31 +898,44 @@ function giComputeNodes(renderer, nodes, deferrable) {
   try {
     const list = Array.isArray(nodes) ? nodes : [nodes];
     const grouping = globalThis.__giComputeGroups !== false;
+    // Reused for every group flushed by THIS call (never handed to
+    // `renderer.compute` itself — see `giComputeGroupFor`, which only ever
+    // dispatches its own cached/sliced copy — so clearing it in place after
+    // each flush is safe). Not module-level: `giDispatchDepth` says this
+    // function can nest, and a nested call must not share the accumulator.
     let batch = [];
     const flushBatch = () => {
       if (!batch.length) return;
       const pending = batch;
-      batch = [];
+      const single = pending.length === 1;
       giComputeGroupStats.calls++;
       giComputeGroupStats.nodes += pending.length;
-      if (pending.length === 1) giComputeGroupStats.singles++;
+      if (single) giComputeGroupStats.singles++;
       else {
         giComputeGroupStats.groups++;
         giComputeGroupStats.maxGroup = Math.max(giComputeGroupStats.maxGroup, pending.length);
       }
-      const names = pending.map((n) => n.__giPassName || n.name || "gi:unnamed");
-      globalThis.__giCurrentComputeName = pending.length === 1 ? names[0] : "gi:compute group";
-      globalThis.__giCurrentComputeNames = names;
+      const nameOf = (n) => n.__giPassName || n.name || "gi:unnamed";
+      // The full name LIST is read only by the freeze ledger / debug tooling
+      // (`__giCurrentComputeNames`); building it is a `.map()` allocation per
+      // flush (~32×/frame) for data nothing reads unless the ledger is armed.
+      // The single current-name string is cheap and always read (by
+      // `giComputeSubmissionBatch`'s stats), so it's built either way.
+      let names = null;
+      const namesFor = () => names ?? (names = pending.map(nameOf));
+      globalThis.__giCurrentComputeName = single ? nameOf(pending[0]) : "gi:compute group";
+      globalThis.__giCurrentComputeNames = freeze.enabled ? namesFor() : null;
       try {
-        renderer.compute(pending.length === 1 ? pending[0] : giComputeGroupFor(pending));
+        renderer.compute(single ? pending[0] : giComputeGroupFor(pending));
       } catch (error) {
         console.error(
-          `[gi] KERNEL DISPATCH FAILED in a group of ${pending.length} (${names.join(", ")}): ${error?.message ?? error}`,
+          `[gi] KERNEL DISPATCH FAILED in a group of ${pending.length} (${namesFor().join(", ")}): ${error?.message ?? error}`,
         );
         throw error;
       } finally {
         globalThis.__giCurrentComputeName = null;
         globalThis.__giCurrentComputeNames = null;
+        batch.length = 0;
       }
     };
     for (const node of list) {

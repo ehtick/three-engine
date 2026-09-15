@@ -122,16 +122,28 @@ function settleRocks(streamer, x, z) {
   assert.equal(streamer.rocksDirty, false, 'streamed stone settled');
 }
 
-/** Every drawn streamed-stone mesh with its LOD and the instance positions. */
-function rockDraws(streamer) {
-  const matrix = new THREE.Matrix4(), point = new THREE.Vector3();
-  return [...streamer.rockMeshes].filter(([, { mesh }]) => mesh.count > 0).map(([key, { mesh }]) => {
+/** Every drawn streamed stone, from either path (09-14: RockBatches, or the
+ * per-`kind:variant:LOD` InstancedMeshes under `__worldRockBatches = false`). */
+function rockInstances(streamer) {
+  const matrix = new THREE.Matrix4(), point = new THREE.Vector3(), out = [];
+  const push = (key, variant, lod, mesh, triangles) => {
+    point.setFromMatrixPosition(matrix);
+    out.push({ key, variant, lod, castShadow: mesh.castShadow, triangles, x: point.x, z: point.z, matrix: [...matrix.elements] });
+  };
+  if (streamer.rocks) {
+    for (const [placement, { entry, id }] of streamer.rocks.instances) {
+      const mesh = entry.batch.mesh;
+      mesh.getMatrixAt(id, matrix);
+      push(`${placement.kind}:${entry.variant.index}:${entry.lod}`, entry.variant, entry.lod, mesh, mesh.getGeometryRangeAt(entry.id).indexCount / 3);
+    }
+    return out;
+  }
+  for (const [key, { mesh }] of streamer.rockMeshes) {
     const [kind, index, lod] = key.split(':');
     const variant = streamer.library.library.variants[kind].find(v => String(v.index) === index);
-    const positions = [];
-    for (let i = 0; i < mesh.count; i++) { mesh.getMatrixAt(i, matrix); point.setFromMatrixPosition(matrix); positions.push([point.x, point.z]); }
-    return { key, mesh, lod: Number(lod), variant, positions };
-  });
+    for (let i = 0; i < mesh.count; i++) { mesh.getMatrixAt(i, matrix); push(key, variant, Number(lod), mesh, mesh.geometry.index.count / 3); }
+  }
+  return out;
 }
 
 test('⚡ streamed stone draws distance LODs and only the near rings cast shadows', () => {
@@ -144,25 +156,26 @@ test('⚡ streamed stone draws distance LODs and only the near rings cast shadow
   settleRocks(streamer, 0, 0);
   let drawn = 0, fullDetail = 0, shadow = 0;
   const lods = new Set();
-  for (const { key, mesh, lod, variant, positions } of rockDraws(streamer)) {
+  for (const { key, lod, variant, castShadow, triangles, x, z } of rockInstances(streamer)) {
     lods.add(lod);
-    drawn += mesh.geometry.index.count / 3 * mesh.count;
-    fullDetail += variant.indices.length / 3 * mesh.count;
-    if (mesh.castShadow) shadow += mesh.geometry.index.count / 3 * mesh.count;
-    assert.equal(mesh.castShadow, lod <= 1, `${key}: only the two nearest rings cast into the shadow map`);
-    const capacity = mesh.instanceMatrix.count;
-    assert.ok(capacity >= 1024 && (capacity & (capacity - 1)) === 0, `${key}: stable instance capacity keeps one program per variant (${capacity})`);
-    for (const [px, pz] of positions) {
-      const d = Math.hypot(px, pz);
-      if (lod === 0) assert.ok(d < 60 + 1e-6, `${key}: full detail stays inside the first ring (${d.toFixed(1)} m)`);
-      if (lod === 2) assert.ok(d >= 160 - 1e-6, `${key}: the coarsest LOD starts at the second ring (${d.toFixed(1)} m)`);
-    }
+    drawn += triangles;
+    fullDetail += variant.indices.length / 3;
+    if (castShadow) shadow += triangles;
+    assert.equal(castShadow, lod <= 1, `${key}: only the two nearest rings cast into the shadow map`);
+    const d = Math.hypot(x, z);
+    if (lod === 0) assert.ok(d < 60 + 1e-6, `${key}: full detail stays inside the first ring (${d.toFixed(1)} m)`);
+    if (lod === 2) assert.ok(d >= 160 - 1e-6, `${key}: the coarsest LOD starts at the second ring (${d.toFixed(1)} m)`);
   }
   assert.ok(lods.has(2), `far stone draws the coarsest LOD (${[...lods]})`);
   assert.ok(drawn < fullDetail * .5, `LODs cut the colour pass (${drawn} of ${fullDetail} triangles)`);
   assert.ok(shadow < fullDetail * .5, `and the shadow pass (${shadow} of ${fullDetail} triangles)`);
   let expected = 0;
-  for (const { mesh } of streamer.rockMeshes.values()) expected += mesh.instanceMatrix.array.byteLength;
+  if (streamer.rocks) expected = streamer.rocks.bytes();
+  for (const { mesh } of streamer.rockMeshes.values()) {
+    const capacity = mesh.instanceMatrix.count;
+    assert.ok(capacity >= 1024 && (capacity & (capacity - 1)) === 0, `${mesh.name}: stable instance capacity keeps one program per variant (${capacity})`);
+    expected += mesh.instanceMatrix.array.byteLength;
+  }
   for (const geometry of streamer.rockGeometries.values()) {
     for (const attribute of Object.values(geometry.attributes)) expected += attribute.array.byteLength;
     expected += geometry.index?.array.byteLength ?? 0;
@@ -171,9 +184,8 @@ test('⚡ streamed stone draws distance LODs and only the near rings cast shadow
   // Walking re-buckets around the new viewer.
   drive(streamer, 150, 0, 20000);
   settleRocks(streamer, 150, 0);
-  for (const { key, lod, positions } of rockDraws(streamer)) {
-    if (lod !== 0) continue;
-    for (const [px, pz] of positions) assert.ok(Math.hypot(px - 150, pz) < 60 + 1e-6, `${key}: full detail follows the viewer`);
+  for (const { key, lod, x, z } of rockInstances(streamer)) {
+    if (lod === 0) assert.ok(Math.hypot(x - 150, z) < 60 + 1e-6, `${key}: full detail follows the viewer`);
   }
   streamer.dispose();
 });
@@ -376,7 +388,7 @@ test('streamed settlements: one plan per cell in any load order, level pads, gra
   drive(streamer, hx, hz);
   let stats = streamer.stats();
   assert.ok(buildings.list.filter(x => x.settlement === plan.id).length === plan.buildings.length, `${plan.id} streamed in whole (${stats.buildings} buildings)`);
-  assert.ok(stats.memory.buildings > 0 && buildings.farMeshes.size > 0, JSON.stringify(stats.memory));
+  assert.ok(stats.memory.buildings > 0 && buildings.draws > 0, JSON.stringify(stats.memory));
   // No plant stands on a lane or a plot.
   const { createLandscapeEcology } = await import('../src/engine/world/landscapeEcology.js');
   const plants = drain(createLandscapeEcology(settled, { seed: 7 }).placeSteps({ x0: plan.bounds[0], z0: plan.bounds[1], x1: plan.bounds[2], z1: plan.bounds[3], distance: 0 }));
@@ -386,6 +398,74 @@ test('streamed settlements: one plan per cell in any load order, level pads, gra
   assert.ok(buildings.list.every(x => x.settlement !== plan.id), 'the village left behind is unloaded');
   streamer.dispose();
   assert.equal(buildings.farMeshes.size, 0);
+  assert.equal(buildings.batches?.far.mesh ?? null, null);
+  assert.equal(buildings.group.children.length, 0);
+});
+
+function withHatch(name, value, make) {
+  const previous = globalThis[name];
+  globalThis[name] = value;
+  try { return make(); } finally { if (previous === undefined) delete globalThis[name]; else globalThis[name] = previous; }
+}
+
+/** Every drawn house part as `role|variant|matrix`, from either path. */
+function buildingInstances(buildings) {
+  const matrix = new THREE.Matrix4(), out = [];
+  const line = (role, variant) => `${role}|${variant}|${matrix.elements.join(',')}`;
+  if (buildings.batches) {
+    for (const record of buildings.batches.records.values()) for (const [batch, id] of record.ids) {
+      batch.mesh.getMatrixAt(id, matrix);
+      out.push(line(record.near ? batch.name.split(' · ')[1] : 'far', record.variant));
+    }
+  } else {
+    for (const [key, { mesh }] of buildings.nearMeshes) for (let i = 0; i < mesh.count; i++) {
+      mesh.getMatrixAt(i, matrix);
+      out.push(line(mesh.name.split(' · ').at(-1), Number(key.split(':')[0])));
+    }
+    for (const [key, { mesh }] of buildings.farMeshes) for (let i = 0; i < mesh.count; i++) { mesh.getMatrixAt(i, matrix); out.push(line('far', Number(key))); }
+  }
+  return out.sort();
+}
+
+test('⚡ streamed houses: one batch per material role across variants, placed exactly as the per-part InstancedMeshes', async t => {
+  // 09-14 Complex scene: one InstancedMesh per variant × part, never culled.
+  const { StreamBuildings } = await import('../src/modules/world/worldStreamBuildings.js');
+  const list = [];
+  for (let i = 0; i < 24; i++) {
+    const a = i * 2.399, r = 20 + i * 12;
+    list.push({ id: `b${i}`, variationSeed: i * 7 + 1, position: [Math.cos(a) * r, 3, Math.sin(a) * r], rotation: [0, a, 0], scale: 1 + (i % 3) * .1 });
+  }
+  const make = hatch => withHatch('__worldBuildingBatches', hatch, () => new StreamBuildings({ nearRadius: 140 }));
+  const batched = make(undefined), legacy = make(false);
+  assert.ok(batched.batches && !legacy.batches, 'the hatch selects the path at construction');
+  const settle = (x, z) => { for (const b of [batched, legacy]) { b.setBuildings(list); for (let k = 0; k < 12; k++) b.update(x, z); } };
+  settle(0, 0);
+  const near = buildingInstances(batched).filter(line => !line.startsWith('far')).length;
+  assert.ok(near > 20 && batched.library.size >= 3, `near houses with several variants (${near} parts, ${batched.library.size} variants)`);
+  assert.deepEqual(buildingInstances(batched), buildingInstances(legacy), 'same parts, variants and matrices');
+  // Render objects per pass: every one of them draws in colour, GI prepass and each cascade.
+  const roles = batched.batches.roles.size;
+  t.diagnostic(`draw objects per pass: batched ${batched.draws}, per-part InstancedMeshes ${legacy.draws}`);
+  assert.ok(batched.draws <= roles + 1, `one draw per role plus the silhouettes (${batched.draws})`);
+  assert.ok(legacy.draws > roles + 1, `negative control: the per-part path fails that gate (${legacy.draws})`);
+  // A borrowed role material outlives its study; nothing else keeps it alive past dispose.
+  let disposed = 0;
+  for (const batch of batched.batches.roles.values()) batch.material.addEventListener('dispose', () => disposed++);
+  // Walk away: every house is a silhouette, the studies are released.
+  settle(2000, 0);
+  assert.equal(batched.library.size, 0);
+  assert.equal(batched.batches.nearGeometry.size, 0);
+  assert.ok([...batched.batches.roles.values()].every(batch => batch.live === 0 && !batch.mesh.visible));
+  assert.equal(batched.batches.far.live, list.length);
+  assert.deepEqual(buildingInstances(batched), buildingInstances(legacy));
+  // And back: role batches refill their freed ranges without new materials.
+  settle(0, 0);
+  assert.deepEqual(buildingInstances(batched), buildingInstances(legacy));
+  assert.equal(disposed, 0, 'no role material was disposed while a batch draws with it');
+  assert.ok(batched.bytes > 0);
+  batched.dispose(); legacy.dispose();
+  assert.ok(disposed >= roles, 'dispose releases the borrowed role materials');
+  assert.equal(batched.group.children.length, 0);
 });
 
 test('a streamed World region meets the streamed landscape without a step at its border', async () => {

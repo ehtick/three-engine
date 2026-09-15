@@ -49,6 +49,10 @@ export function clothComputeBatch(engine) {
     lastKernels: 0,
     lastSources: 0,
     sources: 0,
+    // Scratch output reused every frame — `head` must precede `kernels`, and
+    // `kernels.unshift(...head)` both spread-allocated and shifted every
+    // existing element down per frame. Built fresh each flush, capacity kept.
+    order: [],
     push(kernels) {
       for (const kernel of kernels) this.kernels.push(kernel);
       this.sources++;
@@ -61,17 +65,18 @@ export function clothComputeBatch(engine) {
     for (const before of batch.beforeFlush) {
       try { before(); } catch (error) { console.error("[cloth] flock tick failed", error); }
     }
-    const { kernels, head } = batch;
-    if (head.length) kernels.unshift(...head);
-    head.length = 0;
-    batch.lastKernels = kernels.length;
+    const { kernels, head, order } = batch;
+    order.length = 0;
+    if (head.length) { for (const kernel of head) order.push(kernel); head.length = 0; }
+    for (const kernel of kernels) order.push(kernel);
+    kernels.length = 0;
+    batch.lastKernels = order.length;
     batch.lastSources = batch.sources;
     batch.sources = 0;
-    if (!kernels.length) return;
+    if (!order.length) return;
     // A tick that ran without a render (a suspended viewport) must not let its
     // kernels pile up into the next frame's submission.
-    engine.renderer?.compute(kernels);
-    kernels.length = 0;
+    engine.renderer?.compute(order);
   });
   return batch;
 }

@@ -12,6 +12,7 @@ import {
 import { linkEngineImports } from "../engine/scriptRuntime.js";
 import "../modules/index.js"; // registers the built-in module catalog
 import { deviceQualityCeiling, isPortableDevice } from "../engine/sceneSettings.js";
+import { freeze } from "../engine/freezeLedger.js";
 
 // Bundler tree-shaking would otherwise drop these side-effect registrations
 // — call explicitly so every built-in component is present before any scene
@@ -124,6 +125,56 @@ function createLoadingScreen(engine) {
   });
 }
 
+/**
+ * Shown once the engine has given up rebuilding the renderer after a device
+ * loss (`renderer-rebuild-failed`, after its backoff retries). Styled from the
+ * loading screen's theme variables so a build's colours carry over.
+ */
+function showDeviceLost(failure) {
+  if (document.getElementById("device-lost")) return;
+  const root = document.createElement("div");
+  root.id = "device-lost";
+  root.setAttribute("role", "alertdialog");
+  Object.assign(root.style, {
+    position: "fixed",
+    inset: "0",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "14px",
+    padding: "0 16px",
+    textAlign: "center",
+    background: "var(--loading-bg, #0d0e11)",
+    color: "rgba(var(--loading-fg, 255, 255, 255), 0.72)",
+    font: '13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif',
+    letterSpacing: "0.02em",
+    zIndex: "2147483001",
+  });
+  const title = document.createElement("div");
+  title.textContent = "Graphics device lost";
+  Object.assign(title.style, { fontSize: "15px", fontWeight: "500", color: "rgba(var(--loading-fg, 255, 255, 255), 0.92)" });
+  const detail = document.createElement("div");
+  detail.textContent = "The GPU stopped responding and could not be restarted. Reload to continue.";
+  detail.title = String(failure ?? "");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "Reload";
+  Object.assign(button.style, {
+    font: "inherit",
+    padding: "8px 20px",
+    border: "0",
+    borderRadius: "6px",
+    background: "var(--loading-accent, #0a84ff)",
+    color: "#fff",
+    cursor: "pointer",
+  });
+  button.addEventListener("click", () => location.reload());
+  root.append(title, detail, button);
+  document.body.appendChild(root);
+  button.focus();
+}
+
 // The scene the build boots into. Also readable at its project-relative path
 // (the exporter ships both), so a script can reload the starting level.
 const START_SCENE = "scene.json";
@@ -171,7 +222,21 @@ async function boot() {
   } catch (error) {
     console.warn("[player] ?flags= is not JSON:", error?.message ?? error);
   }
+  // Instrumentation is the editor's. A shipped game installs none of the
+  // freeze ledger's per-call device/render wrappers and resolves no GPU
+  // timestamps, unless asked: `?freezeLedger=1` (or `__freezeLedger: true` in
+  // ?flags=) for the ledger, `?hud=1` / `?timestamps=1` for GPU timings.
+  // Decided before the engine exists — both are read at renderer creation.
+  const bootParams = new URLSearchParams(location.search);
+  freeze.enabled = bootParams.get("freezeLedger") === "1" || globalThis.__freezeLedger === true;
   const engine = new Engine();
+  engine.config.trackTimestamp = bootParams.has("hud") || bootParams.get("timestamps") === "1";
+  // Every scene load compiles its pipelines behind the loading screen (bounded
+  // by a timeout) instead of popping in over its first frames.
+  engine.config.prewarmBlocking = true;
+  // A device loss the engine could not recover from used to leave a blank
+  // canvas and a console line nobody on a phone can read.
+  engine.on("renderer-rebuild-failed", (failure) => showDeviceLost(failure));
   // The inline output transform (engine/outputTransform.js) — one full-res
   // pass fewer per frame; the phone's ledger read three's output quad at 6 ms.
   // `?flags={"__engineDirectOutput":false}` compares against three's path.

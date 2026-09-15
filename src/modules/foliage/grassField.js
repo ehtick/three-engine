@@ -475,13 +475,20 @@ export function grassHexCellPoint(cell, colRow) {
   return [(col + .5 * hexRowParity(row)) * cell, row * grassHexPitch(cell)];
 }
 
-/** CPU mirror of `grassMaterial.js`'s `cellHash2`: two independent values in
- * [0,1) from one cell, exact same constants. */
+// Float32 arithmetic, so the CPU mirrors below replay the GPU's hash-without-
+// sine (Dave Hoskins) step by step instead of drifting in float64.
+const f32 = Math.fround;
+const fract32 = value => f32(value - Math.floor(value));
+
+/** CPU mirror of `grassMaterial.js`'s `cellHash2` (Hoskins hash22): two
+ * independent values in [0,1) from one cell, exact same constants. */
 export function grassCellHash2(cell) {
-  return [
-    frac(Math.sin(cell[0] * 127.1 + cell[1] * 311.7) * 43758.5453),
-    frac(Math.sin(cell[0] * 269.5 + cell[1] * 183.3) * 24634.6345),
-  ];
+  const x = f32(cell[0]), y = f32(cell[1]);
+  let a = fract32(f32(x * f32(.1031))), b = fract32(f32(y * f32(.1030))), c = fract32(f32(x * f32(.0973)));
+  const k = f32(33.33);
+  const d = f32(f32(f32(a * f32(b + k)) + f32(b * f32(c + k))) + f32(c * f32(a + k)));
+  a = f32(a + d); b = f32(b + d); c = f32(c + d);
+  return [fract32(f32(f32(a + b) * c)), fract32(f32(f32(a + c) * b))];
 }
 
 /** The hex lattice cell (col, row) nearest a world XZ point — the Voronoi
@@ -529,11 +536,16 @@ export function grassHexBladeXZ(cell, colRow) {
   return [x0 + jx, z0 + jz];
 }
 
-/** CPU mirror of `grassMaterial.js`'s `cellHash1`: one salted value in [0,1)
- * from a cell. Exact same constants, so a test can assert the shader and the
- * CPU agree on where a clump/patch boundary falls. */
+/** CPU mirror of `grassMaterial.js`'s `cellHash1` (Hoskins hash13 over
+ * `(cell, salt)`): one salted value in [0,1) from a cell. Exact same constants,
+ * so a test can assert the shader and the CPU agree on where a clump/patch
+ * boundary falls. */
 export function grassClumpHash(cell, salt = 0) {
-  return frac(Math.sin(cell[0] * 113.5 + cell[1] * 271.9 + salt * 74.7) * 31251.1234);
+  const m = f32(.1031), k = f32(31.32);
+  let a = fract32(f32(f32(cell[0]) * m)), b = fract32(f32(f32(cell[1]) * m)), c = fract32(f32(f32(salt) * m));
+  const d = f32(f32(f32(a * f32(c + k)) + f32(b * f32(b + k))) + f32(c * f32(a + k)));
+  a = f32(a + d); b = f32(b + d); c = f32(c + d);
+  return fract32(f32(f32(a + b) * c));
 }
 
 /** CPU mirror of `grassMaterial.js`'s shared ring-boundary hash: one value

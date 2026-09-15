@@ -3,6 +3,7 @@ import * as THREE from "three/webgpu";
 import { isPickVisible } from "./pickVisibility.js";
 import { findEntityId } from "./pickTarget.js";
 import { UI_LAYER } from "../engine/editorLayers.js";
+import { ndcDepthRange } from "../engine/reversedDepth.js";
 
 /**
  * Rubber-band ("marquee") selection in the 3D viewport.
@@ -47,11 +48,14 @@ const _centre = new THREE.Vector3();
 export function frustumFromNdcRect(rect, camera, target = new THREE.Frustum()) {
   const x = [rect.minX, rect.maxX];
   const y = [rect.minY, rect.maxY];
+  // NDC z of near/far depends on the camera: -1/1 WebGL, 0/1 WebGPU, 1/0
+  // reversed. A hard-coded -1 under a reversed camera unprojects BEHIND it.
+  const depth = ndcDepthRange(camera);
   _centre.set(0, 0, 0);
   for (let i = 0; i < 4; i++) {
     const [ix, iy] = NDC_CORNERS[i];
-    _near[i].set(x[ix], y[iy], -1).unproject(camera);
-    _far[i].set(x[ix], y[iy], 1).unproject(camera);
+    _near[i].set(x[ix], y[iy], depth.near).unproject(camera);
+    _far[i].set(x[ix], y[iy], depth.far).unproject(camera);
     _centre.add(_near[i]).add(_far[i]);
   }
   _centre.multiplyScalar(1 / 8);

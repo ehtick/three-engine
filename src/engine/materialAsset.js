@@ -16,7 +16,7 @@ import {
   migrateGraph,
   MATERIAL_NODE_SLOTS,
 } from "./tslGraph.js";
-import { loadTextureAsset } from "./textureAsset.js";
+import { acquireTextureAsset, releaseTextureAsset, invalidateTextureAsset } from "./textureAsset.js";
 import { freeze } from "./freezeLedger.js";
 
 
@@ -516,12 +516,21 @@ export function applyMaterialDef(entry, def) {
     if (stock) {
 
       /* map handled by applyStockPbr below */
+      releaseTextureAsset(entry.mapTexture);
+      entry.mapTexture = null;
 
     } else if (def.map) {
 
-      loadTextureAsset(def.map, { colorSpace: THREE.SRGBColorSpace })
+      acquireTextureAsset(def.map, { colorSpace: THREE.SRGBColorSpace })
         .then((texture) => {
-          if (generation !== entry.generation) return;
+          if (generation !== entry.generation) {
+            releaseTextureAsset(texture);
+            return;
+          }
+          // One reference per entry: every re-apply used to load (and leak) a
+          // fresh copy of the same map.
+          releaseTextureAsset(entry.mapTexture);
+          entry.mapTexture = texture;
           material.map = texture;
           material.needsUpdate = true;
           // Visibility depends on the graph's Surface/Volume wiring, not on the
@@ -538,6 +547,8 @@ export function applyMaterialDef(entry, def) {
     } else {
 
       material.map = null;
+      releaseTextureAsset(entry.mapTexture);
+      entry.mapTexture = null;
 
     }
 
@@ -844,6 +855,7 @@ export async function reloadMaterialAsset(path) {
 export function refreshMaterialsUsingTexture(texPath) {
   const key = assetKey(texPath);
   invalidateShaderTextureCache(texPath);
+  invalidateTextureAsset(texPath);
   for (const entry of cache.values()) {
     if (assetKey(entry.def?.map) === key) applyMaterialDef(entry, entry.def);
   }
@@ -852,5 +864,6 @@ export function refreshMaterialsUsingTexture(texPath) {
 /** Re-resolves texture variants after the Basis module is toggled. */
 export function refreshAllMaterials() {
   invalidateShaderTextureCache();
+  invalidateTextureAsset();
   for (const entry of cache.values()) applyMaterialDef(entry, entry.def);
 }

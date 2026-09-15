@@ -1726,8 +1726,10 @@ function buildNode(type, props, ins, ctx) {
       const depth = ins.get("depth") ?? ctx.depthNode ?? null;
       const velocityNode = ins.get("velocity") ?? ctx.velocityNode ?? null;
       const fn = ctx.traa;
+      // `msaaEnabled` is the SCENE PASS's sample count (PostprocessComponent),
+      // not the renderer setting: the canvas MSAA never reaches this graph.
       if (ctx.msaaEnabled) {
-        console.warn("TRAA node: disable Scene Settings > Renderer > Antialiasing (MSAA) to enable temporal reprojection");
+        console.warn("TRAA node: the post scene pass is multisampled, so depth/velocity cannot be reprojected — emitting color passthrough");
         return color;
       }
       if (typeof fn !== "function" || !depth || !velocityNode) {

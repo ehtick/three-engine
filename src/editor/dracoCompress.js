@@ -2,6 +2,7 @@ import { WebIO } from "@gltf-transform/core";
 import { KHRDracoMeshCompression } from "@gltf-transform/extensions";
 import { draco } from "@gltf-transform/functions";
 import { getDracoWasm } from "./dracoWasm.js";
+import { optimizeModelDocument } from "./build/modelOptimize.js";
 import { useModulesStore } from "./modules.js";
 import { useAssetProcessingStore } from "./store/assetProcessingStore.js";
 import { basename } from "./store/projectStore.js";
@@ -109,7 +110,7 @@ async function compressGlbInPlaceImpl(glbPath) {
  * Returns null when the model is already Draco-compressed (nothing to do) or
  * when compression made it bigger, which some lean meshes do.
  */
-export async function compressGlbBuffer(bytes) {
+export async function compressGlbBuffer(bytes, { optimize = false } = {}) {
   const io = await getIO();
   const doc = await io.readBinary(bytes);
   const alreadyDraco = doc
@@ -117,6 +118,9 @@ export async function compressGlbBuffer(bytes) {
     .listExtensionsUsed()
     .some((ext) => ext.extensionName === "KHR_draco_mesh_compression");
   if (alreadyDraco) return null;
+  // Lossless dedup/prune/weld first — fewer vertices and accessors is fewer
+  // bytes for Draco to encode. See build/modelOptimize.js for what it keeps.
+  if (optimize) await optimizeModelDocument(doc);
   await doc.transform(draco());
   const out = await io.writeBinary(doc);
   return out.byteLength < bytes.byteLength ? out : null;

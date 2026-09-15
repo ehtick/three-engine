@@ -109,8 +109,13 @@ export function ensureGodraysShadowMap(engine, light, { size = 1024 } = {}) {
   // map shadows already has one, and stealing it would be a regression.
   if (light.userData?.giShadowMode !== "gi") return null;
 
+  // Every camera three renders gets reversed projection under a reversed
+  // buffer, this light's shadow camera included, so the stored depth is
+  // reversed too and the node's compare has to flip with it. Part of the cache
+  // key: a renderer rebuild can toggle it under a light that keeps its state.
+  const reversed = engine.renderer.reversedDepthBuffer === true;
   let state = light.userData.__godraysShadow;
-  if (!state || state.size !== size) {
+  if (!state || state.size !== size || state.reversed !== reversed) {
     state?.target?.dispose?.();
     const target = new THREE.RenderTarget(size, size, {
       depthBuffer: true,
@@ -128,11 +133,12 @@ export function ensureGodraysShadowMap(engine, light, { size = 1024 } = {}) {
       type: THREE.UnsignedByteType,
     });
     const depth = new THREE.DepthTexture(size, size);
-    depth.compareFunction = THREE.LessCompare; // required by the node's `.compare()`
+    // Required by the node's `.compare()`.
+    depth.compareFunction = reversed ? THREE.GreaterCompare : THREE.LessCompare;
     depth.minFilter = THREE.NearestFilter;
     depth.magFilter = THREE.NearestFilter;
     target.depthTexture = depth;
-    state = { target, size };
+    state = { target, size, reversed };
     light.userData.__godraysShadow = state;
   }
 

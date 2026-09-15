@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Image as ImageIcon, Search, X } from "../icons/index.jsx";
 import { listProjectAssets, TEXTURE_EXTENSIONS, toBlobUrl } from "../assetLoader.js";
 import { useProjectStore, basename } from "../store/projectStore.js";
@@ -21,6 +21,12 @@ export function TexturePicker({ onPick, onCancel }) {
   const rootPath = useProjectStore((s) => s.rootPath);
   const [entries, setEntries] = useState(null); // null = loading
   const [query, setQuery] = useState("");
+  // The texture-search input binds to `query` so every keystroke paints
+  // immediately; the multi-term path filter over `entries` consumes
+  // `deferredQuery` and is allowed to lag a frame. Heavy texture projects
+  // ship thousands of files; the per-entry `relative(...)` + lowercase +
+  // multi-term `.every(...)` substring is the costly path.
+  const deferredQuery = useDeferredValue(query);
   const inputRef = useRef(null);
 
   useEffect(() => {
@@ -44,7 +50,7 @@ export function TexturePicker({ onPick, onCancel }) {
 
   const shown = useMemo(() => {
     const list = entries ?? [];
-    const needle = query.trim().toLowerCase();
+    const needle = deferredQuery.trim().toLowerCase();
     if (!needle) return list;
     // Every whitespace-separated term must appear somewhere in the path, so
     // terms can be given in any order — "idle hero" and "hero idle" both work.
@@ -53,7 +59,7 @@ export function TexturePicker({ onPick, onCancel }) {
       const hay = relative(entry.path ?? entry).toLowerCase();
       return terms.every((term) => hay.includes(term));
     });
-  }, [entries, query, rootPath]);
+  }, [entries, deferredQuery, rootPath]);
 
   return (
     <div className="texture-dialog-backdrop" onPointerDown={onCancel}>

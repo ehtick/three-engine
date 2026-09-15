@@ -1,4 +1,4 @@
-import { loadTextureAsset } from "../textureAsset.js";
+import { acquireTextureAsset } from "../textureAsset.js";
 import { loadMaterialAsset, getMaterialInstance } from "../materialAsset.js";
 import { acquireGeometryAsset, releaseGeometryAsset } from "../geometryAsset.js";
 import { loadAudioAsset, getAudioBuffer } from "../audio/AudioAsset.js";
@@ -25,10 +25,10 @@ import { assetCatalog } from "./catalog.js";
 export class AssetRegistry {
   constructor(engine) {
     this._engine = engine;
-    // loadTextureAsset has no cache of its own (each call decodes + uploads a
-    // fresh GPU texture) — materials get away with that because they load
-    // their map exactly once per .mat. A script calling `texture(path)`
-    // repeatedly (e.g. every frame) would otherwise leak a texture per call.
+    // The registry holds ONE reference per key on the refcounted texture cache
+    // (textureAsset.js) for its lifetime, so a script calling `texture(path)`
+    // every frame neither re-acquires nor leaks, and it gets the same shared
+    // instance materials and sprites render.
     this._textures = new Map(); // cacheKey -> Promise<Texture>
   }
 
@@ -41,7 +41,7 @@ export class AssetRegistry {
     const key = `${path}|${options.colorSpace ?? ""}`;
     let promise = this._textures.get(key);
     if (!promise) {
-      promise = loadTextureAsset(path, options);
+      promise = acquireTextureAsset(path, options);
       this._textures.set(key, promise);
       // A failed load must not poison the cache — the file may appear later.
       promise.catch(() => {

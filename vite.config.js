@@ -142,6 +142,9 @@ export default defineConfig(async () => ({
       "three/examples/jsm/tsl/display/BilateralBlurNode.js",
       "three/examples/jsm/tsl/display/MotionBlur.js",
       "three/examples/jsm/tsl/display/FSR1Node.js",
+      // Lazily imported by gltfLoader.js on the first EXT_meshopt_compression
+      // model — same mid-session re-optimization trap as monaco below.
+      "three/examples/jsm/libs/meshopt_decoder.module.js",
       // The code editor and its vim keymap. Listed even though both are
       // lazy-loaded, and specifically BECAUSE they are: a dep Vite discovers
       // mid-session triggers a re-optimization, which changes every dep

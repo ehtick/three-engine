@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Search, Download, Check, AlertTriangle, Loader2, RefreshCw, Type } from "../icons/index.jsx";
 import {
   fetchFontCatalog,
@@ -111,6 +111,12 @@ export function FontLibraryPanel({ api }) {
   const [catalog, setCatalog] = useState(null);
   const [error, setError] = useState(null);
   const [query, setQuery] = useState("");
+  // The search input is bound directly to `query` so every keystroke paints
+  // immediately; the catalog filter+sort consume `deferredQuery`, which
+  // React is allowed to lag behind by a frame. The Google Fonts catalog is
+  // ~1,900 families, and each entry has family / designers / subsets to
+  // substring-match, then a sort — that's enough to chunk the input.
+  const deferredQuery = useDeferredValue(query);
   const [category, setCategory] = useState("all");
   const [sort, setSort] = useState("defaultSort");
   const [sample, setSample] = useState("The quick brown fox jumps");
@@ -141,7 +147,7 @@ export function FontLibraryPanel({ api }) {
 
   const results = useMemo(() => {
     if (!catalog) return [];
-    const terms = query.trim().toLowerCase();
+    const terms = deferredQuery.trim().toLowerCase();
     let list = catalog.filter((entry) => {
       if (category !== "all" && entry.category !== category) return false;
       if (!terms) return true;
@@ -155,7 +161,7 @@ export function FontLibraryPanel({ api }) {
     else if (sort === "dateAdded") list = [...list].sort((a, b) => b.dateAdded.localeCompare(a.dateAdded));
     else list = [...list].sort((a, b) => a[sort] - b[sort]);
     return list;
-  }, [catalog, query, category, sort]);
+  }, [catalog, deferredQuery, category, sort]);
 
   useEffect(() => setCount(PAGE), [query, category, sort]);
 

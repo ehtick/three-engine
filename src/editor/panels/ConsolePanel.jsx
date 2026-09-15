@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Trash2, Search, X, Info, AlertTriangle, AlertCircle } from "../icons/index.jsx";
 import { useConsoleStore } from "../store/consoleStore.js";
 
@@ -16,6 +16,12 @@ export function ConsolePanel() {
   const listRef = useRef(null);
   const [hiddenLevels, setHiddenLevels] = useState(() => new Set());
   const [query, setQuery] = useState("");
+  // The filter input is bound directly to `query` so every keystroke paints
+  // immediately; the substring filter over `entries` consumes
+  // `deferredQuery`, which React is allowed to lag behind by a frame. Long
+  // sessions can have thousands of log entries, and lowercasing every
+  // message on every keystroke is the part that freezes the input.
+  const deferredQuery = useDeferredValue(query);
 
   const toggleLevel = (key) =>
     setHiddenLevels((prev) => {
@@ -26,11 +32,11 @@ export function ConsolePanel() {
     });
 
   const visible = useMemo(() => {
-    const needle = query.trim().toLowerCase();
+    const needle = deferredQuery.trim().toLowerCase();
     return entries.filter(
       (e) => !hiddenLevels.has(e.level) && (!needle || e.message.toLowerCase().includes(needle))
     );
-  }, [entries, hiddenLevels, query]);
+  }, [entries, hiddenLevels, deferredQuery]);
 
   // Follow the tail as new entries arrive — except while searching: a list
   // jumping under a query the user is reading is worse than a stale scroll.

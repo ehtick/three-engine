@@ -45,13 +45,51 @@ export class EngineVolumetricLightingModel extends LightingModel {
     // knob (Scene Settings → Performance). The raymarch loop is the entire
     // per-pixel cost of a volume, so this single multiplier is the global
     // "volume quality" dial. Floor of 1 keeps degenerate scales rendering.
-    const steps = uniform("int").onRenderUpdate(
-      ({ material }) => Math.max(1, Math.round(material.steps * runtimeQuality.volumeStepScale)),
-    );
+    //
+    // ⚠ A JS-TIME CONSTANT, NOT A UNIFORM. `Loop(node, …)` where `node` reads
+    // a uniform buffer compiles a DYNAMIC loop — the driver can't see the
+    // bound at compile time, so it can't unroll or size registers for it.
+    // `Loop(number, …)` bakes the count into the WGSL as a literal, like any
+    // other fixed-count loop. Baked here, at BUILD time (`start()` runs once
+    // per material (re)compile); a later quality-dial change can't reach an
+    // already-built program, so `volumeQualityWatch` below catches it and
+    // requests exactly one rebuild.
+    const bakedStepScale = runtimeQuality.volumeStepScale;
+    material.__volumeStepScale = bakedStepScale;
+    const steps = Math.max(1, Math.round(material.steps * bakedStepScale));
+    // ⛔ `material.needsUpdate = true` ALONE DOES NOT REBUILD THIS PROGRAM.
+    // Three's own cache-key walk (`RenderObject.getMaterialCacheKey`) reduces
+    // every plain numeric material property to on/off, so `material.steps`
+    // can never signal a change by itself — bumping `version` only makes
+    // `RenderObjects.get()` re-check the cache key, and an unchanged key
+    // takes the cheap "just bump the version" branch, never calling `start()`
+    // again. Same trap and same fix `GISystem.js` uses for its roughness
+    // bucket (`giRoughnessBucketOf`): fold the LIVE dial value into
+    // `customProgramCacheKey()`, so a later change makes the key disagree
+    // with the build's `initialCacheKey` — the actual condition three uses
+    // to dispose and recompile. Installed once; reads the live global, not
+    // the baked snapshot, so the disagreement is visible before the rebuild
+    // it triggers ever runs.
+    if (!material.__volumeCacheKeyPatched) {
+      material.__volumeCacheKeyPatched = true;
+      const original = material.customProgramCacheKey.bind(material);
+      material.customProgramCacheKey = () => original() + "|vol" + runtimeQuality.volumeStepScale;
+    }
+    // The only per-frame check this needs — `start()` itself only runs at a
+    // rebuild, so something has to notice the dial moved and ask three to
+    // look again. Piggybacks on three's existing per-frame uniform-update
+    // pass rather than adding a new one of our own; a uniform absent from
+    // the compiled graph would never have its update callback invoked, so
+    // its (always zero) value is folded into `distTravelled`'s already
+    // harmless starting point below instead of sitting unused.
+    const volumeQualityWatch = uniform(0).onRenderUpdate(({ material }) => {
+      if (material.__volumeStepScale !== runtimeQuality.volumeStepScale) material.needsUpdate = true;
+      return 0;
+    });
     const stepSize = viewVector.length().div(steps).toVar();
     const rayDir = viewVector.normalize().toVar();
 
-    const distTravelled = float(0.0).toVar();
+    const distTravelled = float(0.0).add(volumeQualityWatch).toVar();
     transmittance.assign(vec3(1));
 
     if (material.offsetNode) {

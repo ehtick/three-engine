@@ -34,6 +34,9 @@ const sameSignature = (a, b) => a.length === b.length && a.every((value, i) => v
 export function installWorldDepthPrepass(engine, populations) {
   const entries = [], materials = new Map(), bySource = new Map();
   const retiredSource = new WeakSet(), retiredGeometry = new WeakSet(), retiredMaterial = new WeakSet();
+  // Reused every `sync()` (once per pre-render): `wanted` used to be a fresh
+  // Map and the withdraw loop a fresh `[...entries]` copy every frame.
+  const wanted = new Map(), entriesSnapshot = [];
   let disposed = false, off, offModules;
   const withdraw = entry => {
     if (!entry.active) return;
@@ -77,11 +80,15 @@ export function installWorldDepthPrepass(engine, populations) {
   };
   const sync = () => {
     if (disposed) return;
-    const wanted = new Map();
+    wanted.clear();
     if (contextEligible(engine)) for (const layer of populations) for (const [lod, source] of (layer.renderMeshes ?? []).entries()) {
       if (sourceEligible(layer, source, lod, retiredSource, retiredGeometry, retiredMaterial)) wanted.set(source, { layer, signature: depthSignature(source.material) });
     }
-    for (const entry of [...entries]) {
+    // `withdraw` splices `entries` mid-iteration; snapshot into the reused
+    // scratch array instead of spreading a new one every frame.
+    entriesSnapshot.length = 0;
+    for (const entry of entries) entriesSnapshot.push(entry);
+    for (const entry of entriesSnapshot) {
       const next = wanted.get(entry.source);
       if (!next || entry.geometry !== entry.source.geometry || entry.original !== entry.source.material || !sameSignature(entry.signature, next.signature)) withdraw(entry);
     }

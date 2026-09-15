@@ -17,13 +17,29 @@
 
 const align256 = (n) => Math.ceil(n / 256) * 256;
 
-/** A texture (or texture array) reader: `read(layers)` → one typed array per layer. */
+/**
+ * A texture (or texture array) reader: `read(layers)` → one typed array per layer.
+ * @param {*} renderer
+ * @param {*} texture
+ * @param {{width:number, height:number, layers?:number, bytesPerTexel?:number,
+ *   ArrayType?: Uint8ArrayConstructor|Uint16ArrayConstructor|Uint32ArrayConstructor|
+ *     Int8ArrayConstructor|Int16ArrayConstructor|Int32ArrayConstructor|Float32ArrayConstructor}} options
+ *   The default `ArrayType` (Uint16Array) matches the sea's half-float maps — pass the
+ *   constructor matching the source texture's actual bytesPerTexel/format (e.g. Float32Array
+ *   for a `FloatType` render target).
+ */
 export function createTextureReadback(renderer, texture, { width, height, layers = 1, bytesPerTexel = 8, ArrayType = Uint16Array }) {
   const device = renderer?.backend?.device;
   if (!device) return null;
   const bytesPerRow = align256(width * bytesPerTexel), rowBytes = width * bytesPerTexel, layerBytes = bytesPerRow * height;
   const buffer = device.createBuffer({ label: `${texture.name || 'texture'} readback`, size: layerBytes * layers, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const outputs = Array.from({ length: layers }, () => new ArrayType((rowBytes * height) / ArrayType.BYTES_PER_ELEMENT));
+  // Reused result view: `outputs.slice(0, count)` allocated a fresh array every
+  // read (once per texture per call site, every other frame for the sea's
+  // buoyancy copy). Callers only iterate the result immediately (never retain
+  // it across frames — the typed arrays inside are already the reader's own
+  // and get overwritten next read), so one scratch array serves every call.
+  const view = [];
   let busy = false, disposed = false;
   return {
     get busy() { return busy; },
@@ -48,7 +64,9 @@ export function createTextureReadback(renderer, texture, { width, height, layers
           else for (let row = 0; row < height; row++) out.set(new ArrayType(mapped, layer * layerBytes + row * bytesPerRow, rowBytes / ArrayType.BYTES_PER_ELEMENT), row * rowBytes / ArrayType.BYTES_PER_ELEMENT);
         }
         buffer.unmap();
-        return outputs.slice(0, count);
+        view.length = count;
+        for (let layer = 0; layer < count; layer++) view[layer] = outputs[layer];
+        return view;
       } finally { busy = false; }
     },
     dispose() { disposed = true; if (!busy) buffer.destroy(); else buffer.mapAsync(GPUMapMode.READ).catch(() => {}).finally(() => buffer.destroy()); },

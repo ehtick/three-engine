@@ -65,7 +65,13 @@ const now = () => performance.now();
 
 class FreezeLedger {
   constructor() {
-    /** Master switch. Off in a shipped game unless something turns it on. */
+    /**
+     * Master switch. On for the editor, tests and harnesses; the player turns
+     * it off before building its engine unless `?freezeLedger=1` (see
+     * player/main.js). Read at renderer init: when off, the per-call device
+     * and render wrappers are not installed at all, so flipping it on later
+     * gets spans and long tasks but not the GPU-call rows.
+     */
     this.enabled = true;
     /** Console lines for blocks over LOG_MS. */
     this.logging = true;
@@ -932,11 +938,25 @@ export function installGpuCallLedger(device) {
   // the driver's own threads would be the opposite error, and this project has
   // made it before (a boot probe that timestamped console lines at receipt
   // time turned a 7 s boot into a reported 21.7 s).
+  // In flight until the driver settles the promise — the count a spanless
+  // block reads to say whether the GPU process was saturated. NOT only
+  // instrumentation: asyncRenderPipelines' busy gate and the viewport read
+  // `asyncInFlight`, so it is kept with the ledger off too.
+  const trackInFlight = (result, ticket) => {
+    if (!result || typeof result.then !== "function") return;
+    freeze.asyncInFlight.set(ticket, ticket);
+    const done = () => { freeze.asyncInFlight.delete(ticket); };
+    try { result.then(done, done); } catch { freeze.asyncInFlight.delete(ticket); }
+  };
   const wrapAsync = (method, name, counter, meta) => {
     const original = device[method];
     if (typeof original !== "function") return;
     device[method] = function (descriptor, ...rest) {
-      if (!freeze.enabled) return original.call(this, descriptor, ...rest);
+      if (!freeze.enabled) {
+        const result = original.call(this, descriptor, ...rest);
+        trackInFlight(result, { at: now(), bytes: 0, name });
+        return result;
+      }
       const t0 = now();
       const token = freeze.begin(name);
       let result;
@@ -956,14 +976,7 @@ export function installGpuCallLedger(device) {
           row.ms += ms;
           offenders.set(key, row);
         }
-        // In flight until the driver settles the promise — the count a
-        // spanless block reads to say whether the GPU process was saturated.
-        if (result && typeof result.then === "function") {
-          const ticket = { at: t0, bytes: pipelineBytes(descriptor), name: info?.name ?? name };
-          freeze.asyncInFlight.set(ticket, ticket);
-          const done = () => { freeze.asyncInFlight.delete(ticket); };
-          try { result.then(done, done); } catch { freeze.asyncInFlight.delete(ticket); }
-        }
+        trackInFlight(result, { at: t0, bytes: pipelineBytes(descriptor), name: info?.name ?? name });
       }
     };
   };
@@ -986,7 +999,10 @@ export function installGpuCallLedger(device) {
   device.createShaderModule = function (descriptor, ...rest) {
     let desc = descriptor;
     let canonical = null;
-    if (descriptor && typeof descriptor.code === "string" && freeze.enabled) {
+    // Not gated on `freeze.enabled`: canonical text + interning are a compile
+    // win (browser shader cache hits, deduped modules), not instrumentation,
+    // and a player with the ledger off must keep them.
+    if (descriptor && typeof descriptor.code === "string") {
       const entry = registry.record(descriptor.label, descriptor.code, {
         canonical: globalThis.__wgslCanonical !== false,
       });
@@ -1014,17 +1030,22 @@ export function installGpuCallLedger(device) {
   // `writeBuffer` of uniforms, a `createBindGroup`, the `submit` — so each is
   // its own span (no counters: these run hundreds of times a frame and a span
   // under the ring floor costs two `performance.now()`s).
+  //
+  // These are the ledger's real per-frame cost, so with the ledger off at
+  // install (a shipped player) they are not wrapped at all, rather than
+  // wrapped and bypassed on every call.
+  if (!freeze.enabled) return true;
+  const countWrite = (n) => {
+    freeze.gpu.writeBytes += n;
+    freeze.gpu.writes++;
+    if (n > freeze.gpu.largestWrite) freeze.gpu.largestWrite = n;
+  };
   const span = (target, method, name, bytesOf = null) => {
     const original = target?.[method];
     if (typeof original !== "function") return;
     target[method] = function (...args) {
       if (!freeze.enabled) return original.apply(this, args);
-      if (bytesOf) {
-        const n = bytesOf(args) || 0;
-        freeze.gpu.writeBytes += n;
-        freeze.gpu.writes++;
-        if (n > freeze.gpu.largestWrite) freeze.gpu.largestWrite = n;
-      }
+      if (bytesOf) countWrite(bytesOf(args) || 0);
       const token = freeze.begin(name);
       try {
         return original.apply(this, args);
@@ -1036,21 +1057,44 @@ export function installGpuCallLedger(device) {
   span(device, "createBindGroup", "gpu:createBindGroup");
   span(device, "createBuffer", "gpu:createBuffer");
   span(device, "createTexture", "gpu:createTexture");
-  span(device.queue, "submit", "gpu:submit");
+  // The two hottest calls get fixed-arity wrappers: no rest array and no
+  // `apply` per call. An `undefined` optional tail is WebIDL's "not passed".
+  const queue = device.queue;
+  const submit = queue?.submit;
+  if (typeof submit === "function") {
+    queue.submit = function (commandBuffers) {
+      if (!freeze.enabled) return submit.call(this, commandBuffers);
+      const token = freeze.begin("gpu:submit");
+      try {
+        return submit.call(this, commandBuffers);
+      } finally {
+        freeze.end(token);
+      }
+    };
+  }
   // writeBuffer(buffer, offset, data, dataOffset?, size?) — three hands the
   // WHOLE attribute array as `data` and bounds the write with `dataOffset` /
   // `size` (in elements for a typed view), so the view's byteLength would
   // over-count a partial upload by the size of the array: the first version
   // read 10 GB written in one 60 ms task.
-  span(device.queue, "writeBuffer", "gpu:writeBuffer", (args) => {
-    const data = args[2];
-    if (!data) return 0;
-    const unit = data.BYTES_PER_ELEMENT ?? 1;
-    const size = args[4];
-    if (size != null && Number.isFinite(size)) return Math.max(0, size * unit);
-    const offset = (args[3] ?? 0) * unit;
-    return Math.max(0, (data.byteLength ?? 0) - offset);
-  });
+  const writeBuffer = queue?.writeBuffer;
+  if (typeof writeBuffer === "function") {
+    queue.writeBuffer = function (buffer, offset, data, dataOffset, size) {
+      if (!freeze.enabled) return writeBuffer.call(this, buffer, offset, data, dataOffset, size);
+      if (data) {
+        const unit = data.BYTES_PER_ELEMENT ?? 1;
+        countWrite(size != null && Number.isFinite(size)
+          ? Math.max(0, size * unit)
+          : Math.max(0, (data.byteLength ?? 0) - (dataOffset ?? 0) * unit));
+      }
+      const token = freeze.begin("gpu:writeBuffer");
+      try {
+        return writeBuffer.call(this, buffer, offset, data, dataOffset, size);
+      } finally {
+        freeze.end(token);
+      }
+    };
+  }
   span(device.queue, "writeTexture", "gpu:writeTexture", (args) => args[1]?.byteLength ?? 0);
   span(device.queue, "copyExternalImageToTexture", "gpu:copyExternalImageToTexture");
   return true;

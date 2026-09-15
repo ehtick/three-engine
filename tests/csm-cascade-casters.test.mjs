@@ -94,3 +94,18 @@ test("lazy CSM setup installs the filter on every cascade's shadow node", () => 
   for (const node of csm._shadowNodes) assert.equal(node.__cascadeCasters, true);
   assert.ok(cascadeReceiverRange(csm, 0), "a real CSM node yields receiver ranges");
 });
+
+test("lazy CSM setup installs the filter under a reversed depth buffer too", () => {
+  const light = new THREE.DirectionalLight();
+  const owner = new THREE.Object3D();
+  owner.add(light, light.target);
+  const camera = new THREE.PerspectiveCamera(60, 1.5, 0.1, 500);
+  camera._reversedDepth = true; // what a reversed renderer does to every camera
+  camera.updateProjectionMatrix();
+  const csm = new EngineCSMShadowNode(light, { cascades: 3, maxFar: 500 });
+  csm._init({ camera, renderer: { coordinateSystem: THREE.WebGPUCoordinateSystem, reversedDepthBuffer: true } });
+  assert.equal(csm._shadowNodes.length, 3);
+  for (const node of csm._shadowNodes) assert.equal(node.__cascadeCasters, true);
+  const range = cascadeReceiverRange(csm, 0);
+  assert.ok(range, "a reversed CSM node yields receiver ranges");
+});

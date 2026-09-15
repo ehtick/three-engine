@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useMemo, useRef, useState } from "react";
 import { Box, ChevronDown, Search, TriangleAlert } from "../icons/index.jsx";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useEntityDrop } from "../entityDrag.js";
@@ -27,6 +27,13 @@ export function EntityField({ descriptor, value, onCommit }) {
   const entities = useSceneStore((s) => s.entities);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  // The dropdown search input binds to `query` so every keystroke paints
+  // immediately; the lowercased substring filter over the scene's entity
+  // list consumes `deferredQuery`. A scene with thousands of entities opens
+  // many of these pickers per inspector — without the defer, the filter
+  // chunked the input. Enter-to-pick and Escape still read `query` so the
+  // intent of the just-typed character survives a one-frame lag.
+  const deferredQuery = useDeferredValue(query);
   const triggerRef = useRef(null);
   const filter = descriptor.filter;
   const passes = useCallback((e) => !!e && (!filter || filter(e)), [filter]);
@@ -55,7 +62,7 @@ export function EntityField({ descriptor, value, onCommit }) {
         .sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path)),
     [entities, passes],
   );
-  const needle = query.trim().toLowerCase();
+  const needle = deferredQuery.trim().toLowerCase();
   const matches = needle
     ? options.filter((o) => o.name.toLowerCase().includes(needle) || o.path.toLowerCase().includes(needle))
     : options;

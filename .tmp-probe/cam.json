@@ -1,0 +1,17 @@
+[three-engine] MCP server ready on stdio
+[three-engine] attached to bridge broker pid 22768 on port 17325
+[three-engine] editor connected (262 tools)
+{
+  "position": [
+    -230.99088263818095,
+    8.147259351000638,
+    27.23900487958715
+  ],
+  "target": [
+    -281.71192372030293,
+    25.41933961101727,
+    11.86922132921696
+  ],
+  "fov": 60,
+  "orthographic": false
+}

@@ -1,5 +1,6 @@
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
+import { getGltfKTX2Loader } from "./textureAsset.js";
 
 /**
  * Shared GLTF loader with Draco decoding wired in.
@@ -97,7 +98,24 @@ function getDracoLoader() {
   return dracoLoader;
 }
 
-/** A fresh GLTFLoader with Draco decoding attached. */
+// EXT_meshopt_compression / KHR_meshopt_compression. GLTFLoader wants the
+// decoder object synchronously, but the decoder (WASM inlined in JS, no extra
+// file) should stay out of the startup chunk, so hand it a stand-in that
+// imports the real one on the first compressed buffer.
+let meshoptDecoderPromise = null;
+const loadMeshoptDecoder = () =>
+  (meshoptDecoderPromise ??= import("three/addons/libs/meshopt_decoder.module.js").then((m) => m.MeshoptDecoder));
+const lazyMeshoptDecoder = {
+  supported: typeof WebAssembly === "object",
+  get ready() {
+    return loadMeshoptDecoder().then((decoder) => decoder.ready);
+  },
+  decodeGltfBufferAsync(count, stride, source, mode, filter) {
+    return loadMeshoptDecoder().then((decoder) => decoder.decodeGltfBufferAsync(count, stride, source, mode, filter));
+  },
+};
+
+/** A fresh GLTFLoader with Draco, meshopt and KTX2 (KHR_texture_basisu) decoding. */
 /**
  * `manager` is optional and exists for one job: sources whose sibling
  * resources do not live where the .gltf's URIs say they do. Poly Haven's CDN
@@ -108,7 +126,10 @@ function getDracoLoader() {
 export function createGltfLoader(manager = undefined) {
   return new GLTFLoader(manager)
     .register((parser) => new LegacySpecGlossExtension(parser))
-    .setDRACOLoader(getDracoLoader());
+    .setDRACOLoader(getDracoLoader())
+    // Without these GLTFLoader throws for any model that REQUIRES the extension.
+    .setMeshoptDecoder(lazyMeshoptDecoder)
+    .setKTX2Loader(/** @type {any} */ (getGltfKTX2Loader()));
 }
 
 let shared = null;

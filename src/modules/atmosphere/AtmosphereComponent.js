@@ -14,6 +14,8 @@ import { cloudOpacityAt } from "./cloudNoise.js";
 import { createCloudShadowUniforms, installCloudShadow, removeCloudShadow } from "./cloudShadow.js";
 import { createSkyOcclusion } from "./skyOcclusion.js";
 import { prepareSkyEnvironment } from "./prepareSkyEnvironment.js";
+import { skyPmremDue, skySnapshot } from "./skyEnvironmentRefresh.js";
+import { shadowSnapBasis, snapShadowCentre, wholeTexelStep } from "../../engine/shadowSnap.js";
 
 /**
  * ⭐⭐⭐ ONE COMPONENT FOR THE SKY AND THE WEATHER, BECAUSE THEY ARE ONE THING.
@@ -60,11 +62,10 @@ const SKY_SUN_EPSILON = 0.026;
 /** …but a sky whose COLOUR is moving fast refreshes on the colour instead, so
  *  a sunset never steps: mean relative change of irradiance and horizon. */
 const SKY_COLOUR_EPSILON = 0.012;
-/** Seconds between prefiltered-radiance rebuilds. Regenerating the PMREM runs
- *  EIGHT nested `renderer.render` calls inside the frame that asks for it
- *  (`PMREMNode.updateBefore` → `PMREMGenerator.fromEquirectangular`), so it is
- *  the one part of a sky refresh that must never be per-refresh. */
-const SKY_PMREM_SECONDS = 1.2;
+// Prefiltered-radiance (PMREM) rebuilds run EIGHT nested `renderer.render`
+// calls inside the frame that asks for one, so they are gated on the sky
+// having changed perceptibly since the last rebuild — not on a timer. See
+// `skyEnvironmentRefresh.js` and `_maybeRebuildEnvironment`.
 /** Nor for a weather change smaller than this, summed over every channel. */
 const SKY_WEATHER_EPSILON = 0.004;
 /** Game hours per real minute when the clock is frozen but weather is on auto. */
@@ -110,8 +111,13 @@ const SUN_HOLD_MIN_DEG = 0.05;
 const SUN_HOLD_MAX_DEG = 0.5;
 const SUN_DEG2RAD = Math.PI / 180;
 /** …and metres the camera may drift before an OWNED sun re-centres its shadow
- *  frustum. The frustum is 90 m across, so four is invisible. */
+ *  frustum. The frustum is 90 m across, so four is invisible. Rounded down to
+ *  whole texels (`wholeTexelStep`) so a recentre never swims shadow edges. */
 const SUN_ANCHOR_STEP = 4;
+/** The owned sun's ortho half-extent (m), map size, and caster reach up-sun. */
+const OWNED_SUN_HALF = 45;
+const OWNED_SUN_MAP = 2048;
+const OWNED_SUN_REACH = 120;
 /** Metres per second the authored dial may reach. A hurricane is ~33 m/s and
  *  a blizzard preset is already 15, so this is the top of real weather. */
 const WIND_CEILING = 35;
@@ -131,6 +137,24 @@ const FORWARD = new THREE.Vector3(0, 0, -1);
 const _direction = new THREE.Vector3();
 const _cameraPosition = new THREE.Vector3();
 const _quaternion = new THREE.Quaternion();
+const _snapCentre = new THREE.Vector3();
+const _snapTravel = new THREE.Vector3();
+const _snapRight = new THREE.Vector3();
+const _snapUp = new THREE.Vector3();
+
+/**
+ * Snaps `centre` (the camera position) onto the owned sun's whole-texel grid.
+ * `toward` points at the sun; the map's basis follows the light's TRAVEL.
+ * Exported for the unit test.
+ * @param {THREE.Vector3} centre in/out
+ * @param {THREE.Vector3} toward unit vector towards the sun
+ */
+export function ownedSunShadowCentre(centre, toward) {
+  _snapTravel.copy(toward).negate();
+  shadowSnapBasis(_snapTravel, _snapRight, _snapUp);
+  const step = wholeTexelStep(SUN_ANCHOR_STEP, (OWNED_SUN_HALF * 2) / OWNED_SUN_MAP);
+  return snapShadowCentre(centre, _snapTravel, _snapRight, _snapUp, step, step, step);
+}
 
 export class AtmosphereComponent extends Component {
   static type = "atmosphere";
@@ -320,6 +344,8 @@ export class AtmosphereComponent extends Component {
      *  changes nothing the eye or GI can see is not published at all. */
     this._lastPublished = null;
     this._lastPmrem = -Infinity;
+    /** The sky snapshot the current PMREM was BUILT from (null = none yet). */
+    this._pmremBaseline = null;
     /** Seconds since attach, until the roof capture has been warmed; then null. */
     this._warmClock = null;
     this._stats = { status: "Detached" };
@@ -752,9 +778,15 @@ export class AtmosphereComponent extends Component {
         rowStart: this._fillRow, rowCount: rows,
       });
       this._fillRow += rows;
-      if (this._fillRow >= SKY_HEIGHT) this._publishSky(this._fillParams, now);
+      if (this._fillRow >= SKY_HEIGHT) {
+        this._publishSky(this._fillParams, now);
+        this._maybeRebuildEnvironment(now);
+      }
       return;
     }
+    // Every idle frame too: a small change is flushed only once it has STOPPED,
+    // and stopping is exactly the frame on which nothing publishes.
+    this._maybeRebuildEnvironment(now);
     _direction.fromArray(parameters.sunDirection);
     const moved = _direction.angleTo(this._lastFillSun);
     // How fast the sun is actually travelling, in radians per second — 0 when
@@ -804,6 +836,7 @@ export class AtmosphereComponent extends Component {
       fillSkyEquirect(this.skyData, SKY_WIDTH, SKY_HEIGHT, parameters);
       this._fillRow = SKY_HEIGHT;
       this._publishSky(parameters, now);
+      this._maybeRebuildEnvironment(now);
     } else {
       this._fillRow = 0;
     }
@@ -832,14 +865,34 @@ export class AtmosphereComponent extends Component {
   _publishSky(parameters, now) {
     this.skyTexture.needsUpdate = true;
     this._lastFill = now;
-    this._lastPublished = {
-      irradiance: [...parameters.irradiance],
-      horizon: [...parameters.horizon],
-    };
-    if (now - this._lastPmrem >= SKY_PMREM_SECONDS * 1000) {
-      this._lastPmrem = now;
-      this.skyTexture.needsPMREMUpdate = true;
-    }
+    // `irradiance` / `horizon` are what `_refreshSky`'s colour gate reads.
+    this._lastPublished = skySnapshot(parameters);
+  }
+
+  /**
+   * ⭐ THE IBL FOLLOWS THE SKY, NOT A TIMER (2026-09-14). It was rebuilt every
+   * 1.2 s whenever a dome refresh had landed — i.e. continuously under a
+   * running clock, for changes the prefiltered lighting cannot show. Now it is
+   * compared with the sky it was last BUILT from (`skyPmremDue`): a perceptual
+   * change rebuilds (still ≥ 1.2 s apart), a small one is flushed once it has
+   * stopped, and an unchanged sky — a paused clock — never rebuilds after the
+   * first. Only WHEN changes; `needsPMREMUpdate` is still the one trigger.
+   * Called only with no fill in flight, so the GPU texture is `_lastPublished`.
+   */
+  _maybeRebuildEnvironment(now) {
+    const current = this._lastPublished;
+    if (!current || !this.skyTexture) return;
+    const due = skyPmremDue({
+      baseline: this._pmremBaseline,
+      current,
+      secondsSincePmrem: (now - this._lastPmrem) / 1000,
+      secondsSincePublish: (now - this._lastFill) / 1000,
+      clockRunning: (this._sunAngularRate ?? 0) > 0,
+    });
+    if (!due) return;
+    this._lastPmrem = now;
+    this._pmremBaseline = current;
+    this.skyTexture.needsPMREMUpdate = true;
   }
 
   _applySky(engine, parameters, celestial, light) {
@@ -963,11 +1016,11 @@ export class AtmosphereComponent extends Component {
       // entities' LightComponents, and this light deliberately has neither.
       light.userData.atmosphereOwned = true;
       light.castShadow = true;
-      light.shadow.mapSize.set(2048, 2048);
+      light.shadow.mapSize.set(OWNED_SUN_MAP, OWNED_SUN_MAP);
       light.shadow.camera.near = 0.5;
       light.shadow.camera.far = 260;
-      light.shadow.camera.left = light.shadow.camera.bottom = -45;
-      light.shadow.camera.right = light.shadow.camera.top = 45;
+      light.shadow.camera.left = light.shadow.camera.bottom = -OWNED_SUN_HALF;
+      light.shadow.camera.right = light.shadow.camera.top = OWNED_SUN_HALF;
       // ⚠ `LightShadow.updateMatrices` never calls this — it only moves the
       // camera. Without it the frustum stays at three's default ±5 m and the
       // owned sun casts shadows inside a ten-metre box at the world origin.
@@ -1062,12 +1115,19 @@ export class AtmosphereComponent extends Component {
     const wantVisible = applied.visible ? intensity > 0.0002 : intensity > 0.002;
     // An OWNED light carries its own shadow frustum around the camera, so it
     // has one more reason to move that an entity light does not.
+    // ⭐ TEXEL-SNAPPED, IN THE SHADOW CAMERA'S OWN BASIS (2026-09-14). The old
+    // anchor re-centred on the RAW camera position after 4 m of drift, so every
+    // recentre moved the 2048² map by a fraction of a texel (edges swam) and the
+    // depth axis stayed continuous. Now the centre lives on a whole-texel grid
+    // across the map and along the light — the same snap LightComponent uses —
+    // and "drifted" means the snapped cell changed.
     let drifted = false;
     if (!sun.entity) {
       const camera = engine.camera;
-      if (camera) camera.getWorldPosition(_cameraPosition); else _cameraPosition.set(0, 0, 0);
-      drifted = !(applied.anchor.distanceToSquared(_cameraPosition) <= SUN_ANCHOR_STEP * SUN_ANCHOR_STEP);
-      if (drifted) applied.anchor.copy(_cameraPosition);
+      if (camera) camera.getWorldPosition(_snapCentre); else _snapCentre.set(0, 0, 0);
+      ownedSunShadowCentre(_snapCentre, _direction);
+      drifted = !(applied.anchor.distanceToSquared(_snapCentre) < 1e-10);
+      if (drifted) applied.anchor.copy(_snapCentre);
     }
     // §smooth-sun / §sun-shadow-hz: `__atmosphereSmoothSun = false` is a flat
     // kill switch back to the old stepped light regardless of the clock.
@@ -1113,11 +1173,10 @@ export class AtmosphereComponent extends Component {
     } else {
       // The owned light has no LightComponent to recentre its shadow, so it
       // follows the camera itself — otherwise its 90 m frustum stays at the
-      // world origin and everything else is unshadowed.
-      const camera = engine.camera;
-      if (camera) camera.getWorldPosition(_cameraPosition); else _cameraPosition.set(0, 0, 0);
-      sun.light.target.position.copy(_cameraPosition);
-      sun.light.position.copy(_cameraPosition).addScaledVector(_direction, 120);
+      // world origin and everything else is unshadowed. `applied.anchor` is
+      // this frame's snapped centre (computed above for the drift test).
+      sun.light.target.position.copy(applied.anchor);
+      sun.light.position.copy(applied.anchor).addScaledVector(_direction, OWNED_SUN_REACH);
       sun.light.target.updateMatrixWorld(true);
       sun.light.updateMatrixWorld(true);
       sun.light.visible = wantVisible;

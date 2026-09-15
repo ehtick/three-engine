@@ -1,6 +1,8 @@
 import * as THREE from "three/webgpu";
 import { resolveAssetUrl, loadAssetMeta } from "./assetResolver.js";
 import { applyTextureMeta } from "./textureMeta.js";
+import { vmState } from "./vmState.js";
+import { createRefCountedCache, assetPathKey, assetPathMatches } from "./refCountedCache.js";
 
 const imageLoader = new THREE.TextureLoader();
 let textureRenderer = null;
@@ -85,7 +87,10 @@ async function loadBasisWithTimeout(loader, url) {
 
 /** Controlled by the optional Basis engine module. */
 export function setBasisCompressionEnabled(enabled) {
-  basisCompressionEnabled = enabled === true;
+  const next = enabled === true;
+  // Cached textures were resolved against the other variant (.basis vs source).
+  if (next !== basisCompressionEnabled) invalidateTextureAsset();
+  basisCompressionEnabled = next;
 }
 
 /** Must be called after renderer.init(); selects the best GPU target format. */
@@ -147,6 +152,39 @@ async function getBasisLoader() {
 }
 
 /**
+ * KHR_texture_basisu textures inside a glTF go through the SAME KTX2Loader,
+ * worker pool, concurrency gate and hang watchdog as `.basis` assets — a second
+ * KTX2Loader would spawn a second transcoder pool. GLTFLoader needs a loader
+ * object synchronously, so this stand-in resolves the lazy one per load. It
+ * ignores the Basis module toggle on purpose: an embedded KTX2 has no source
+ * image to fall back to (like Draco, decoding is always available).
+ */
+const gltfKTX2Loader = {
+  load(url, onLoad, _onProgress, onError) {
+    loadGltfBasisTexture(url).then(onLoad, (error) => onError?.(error));
+  },
+};
+
+async function loadGltfBasisTexture(url) {
+  if (basisDisabledForSession) throw new Error("Basis transcoding is disabled for this session");
+  await acquireBasisSlot();
+  try {
+    const loader = await getBasisLoader();
+    if (!loader) throw new Error("KTX2 texture requested before the renderer was configured");
+    const texture = await loadBasisWithTimeout(loader, url);
+    basisConsecutiveTimeouts = 0;
+    return texture;
+  } finally {
+    releaseBasisSlot();
+  }
+}
+
+/** The shared KTX2 loader for `GLTFLoader.setKTX2Loader`. */
+export function getGltfKTX2Loader() {
+  return gltfKTX2Loader;
+}
+
+/**
  * How many `loadTextureAsset` calls are still unresolved, queue included.
  *
  * This is THE "are textures still streaming" signal for systems that must not
@@ -188,11 +226,71 @@ export async function waitForTextureAssets(timeoutMs = 15_000) {
 }
 
 /**
+ * ONE refcounted texture per (path + every option baked in at load). Before
+ * this each caller decoded and uploaded its own copy of the same image.
+ *
+ * ⚠ WebGPU uploads per Texture OBJECT, not per Source: `texture.clone()` shares
+ * the decoded image but gets its own GPU texture. So callers that want GPU
+ * sharing take the shared instance (`acquireTextureAsset`) and must not mutate
+ * it; anything baked per caller (wrap mode) belongs in the key instead.
+ */
+const textureCache = vmState("textureAssetCache", () =>
+  createRefCountedCache({
+    load: (key, path, options) => loadTrackedTexture(path, options),
+    dispose: (texture) => texture?.dispose?.(),
+  }),
+);
+
+function textureCacheKey(path, { colorSpace = null, wrapS = null, wrapT = null } = {}) {
+  return `${assetPathKey(path)}|${colorSpace ?? ""}|${wrapS ?? ""}|${wrapT ?? ""}`;
+}
+
+/**
+ * Borrows the SHARED texture for `path`. Do not mutate or dispose it — pass
+ * per-use state through `options` (`colorSpace`, `wrapS`, `wrapT`) — and
+ * return it with `releaseTextureAsset` exactly once.
+ */
+export function acquireTextureAsset(path, options = {}) {
+  return textureCache.acquire(textureCacheKey(path, options), path, options);
+}
+
+/** Returns a texture borrowed via `acquireTextureAsset`. Unknown values are ignored. */
+export function releaseTextureAsset(texture) {
+  return texture ? textureCache.release(texture) : false;
+}
+
+/**
+ * Retires cached textures for `path` (all when null) after the image, its
+ * `.meta` import settings or its `.basis` derivative changed. Current holders
+ * keep theirs until they release; the next acquire decodes fresh.
+ */
+export function invalidateTextureAsset(path = null) {
+  if (path == null) return textureCache.invalidate();
+  const base = assetPathKey(path).replace(/\.(meta|basis)$/i, "");
+  return textureCache.invalidate((key) => assetPathMatches(key.slice(0, key.indexOf("|")), base));
+}
+
+/**
  * Loads an image asset, preferring its generated `<path>.basis` KTX2 when the
  * per-asset toggle is enabled. A missing/stale derivative safely falls back to
  * the source image, which keeps projects portable and source assets editable.
+ *
+ * Returns a PRIVATE texture the caller may mutate and dispose: a clone of the
+ * cached decode, whose `dispose()` also releases that decode. It does not share
+ * the GPU upload — prefer `acquireTextureAsset` where the texture is read-only.
  */
-export async function loadTextureAsset(path, options) {
+export async function loadTextureAsset(path, options = {}) {
+  const shared = await acquireTextureAsset(path, options);
+  const texture = shared.clone();
+  const onDispose = () => {
+    texture.removeEventListener("dispose", onDispose);
+    releaseTextureAsset(shared);
+  };
+  texture.addEventListener("dispose", onDispose);
+  return texture;
+}
+
+async function loadTrackedTexture(path, options) {
   textureLoadsInFlightCount++;
   textureLoadProgress++;
   try {
@@ -203,7 +301,7 @@ export async function loadTextureAsset(path, options) {
   }
 }
 
-async function loadTextureAssetInner(path, { colorSpace = null } = {}) {
+async function loadTextureAssetInner(path, { colorSpace = null, wrapS = null, wrapT = null } = {}) {
   const meta = await loadAssetMeta(`${path}.meta`);
   let texture = null;
 
@@ -242,5 +340,8 @@ async function loadTextureAssetInner(path, { colorSpace = null } = {}) {
   if (!texture) texture = await imageLoader.loadAsync(await resolveAssetUrl(path));
   if (colorSpace) texture.colorSpace = colorSpace;
   applyTextureMeta(texture, meta);
+  // After the meta: a caller-requested wrap (ribbon tile/stretch) overrides import settings.
+  if (wrapS != null) texture.wrapS = wrapS;
+  if (wrapT != null) texture.wrapT = wrapT;
   return texture;
 }

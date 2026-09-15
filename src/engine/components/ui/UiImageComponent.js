@@ -2,7 +2,7 @@ import * as THREE from "three/webgpu";
 import { Component } from "../Component.js";
 import { createUiImageMaterial, applyElementUniforms } from "../../ui/uiMaterial.js";
 import { UI_LAYER } from "../../ui/UiSystem.js";
-import { loadTextureAsset } from "../../textureAsset.js";
+import { acquireTextureAsset, releaseTextureAsset } from "../../textureAsset.js";
 import { atlasImagePath, findRegion, loadAtlasAsset, regionUv } from "../../sprite/atlasAsset.js";
 
 // One shared unit plane for every UI quad — meshes scale it per-rect.
@@ -96,14 +96,14 @@ export class UiImageComponent extends Component {
       this.mesh.material.dispose();
       this.mesh = null;
     }
-    this.textureMap?.dispose();
+    releaseTextureAsset(this.textureMap);
     this.textureMap = null;
   }
 
   onPropChanged(key) {
     if (!this.mesh) return;
     if (key === "texture" || key === "atlas") {
-      this.textureMap?.dispose();
+      releaseTextureAsset(this.textureMap);
       this.textureMap = null;
       this.#loadSource();
     } else if (key === "fillMode" || key === "imageType") {
@@ -139,11 +139,13 @@ export class UiImageComponent extends Component {
         this.#rebuildMaterial();
         return;
       }
-      const tex = await loadTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
+      // Shared, read-only: every button using one skin shares its GPU texture.
+      const tex = await acquireTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
       if (generation !== this.generation || !this.mesh) {
-        tex.dispose();
+        releaseTextureAsset(tex);
         return;
       }
+      releaseTextureAsset(this.textureMap);
       this.textureMap = tex;
       this.#rebuildMaterial();
     } catch (err) {

@@ -97,6 +97,17 @@ async function loadEngine() {
       // by assetLoader.js) so the lightweight asset modules stay free of
       // `three/webgpu`.
       onAssetInvalidated(invalidateGeometryAsset);
+      // Same for parsed GLBs and decoded textures (refcounted caches keyed by
+      // path): a rewritten file must not be served from the old decode.
+      const [{ invalidateModelAsset }, { invalidateTextureAsset }] = await Promise.all([
+        import("../engine/modelAsset.js"),
+        import("../engine/textureAsset.js"),
+      ]);
+      onAssetInvalidated((path) => {
+        if (!path) return;
+        invalidateModelAsset(path);
+        invalidateTextureAsset(path);
+      });
       // Derived data (hash-keyed baked SDFs etc.) lives in `<project>/Library`
       // — read lazily so it tracks whichever project is currently open.
       setDerivedDataRootProvider(() => {

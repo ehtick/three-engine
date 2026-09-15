@@ -172,7 +172,7 @@ function MaterialPreview({ material }) {
     let camera;
     (async () => {
       renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true });
-      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
       // The camera's aspect MUST be refreshed here, not just the renderer's
       // size. This panel commonly mounts inside a hidden dock tab, where the
       // canvas is 0x0 — deriving the aspect once from clientWidth/clientHeight

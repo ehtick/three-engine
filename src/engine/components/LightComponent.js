@@ -9,6 +9,14 @@ import { Component } from "./Component.js";
 import { PCSSShadowFilter } from "../pcssShadowFilter.js";
 import { SHADOW_PROXY_LAYER } from "../editorLayers.js";
 import { capShadowMapSize } from "../sceneSettings.js";
+import { shadowSnapBasis, snapShadowCentre } from "../shadowSnap.js";
+import {
+  MOBILE_CLIPMAP_LEVELS,
+  MOBILE_CSM_CASCADES,
+  coveragePreservingClipmapScale,
+  reducedPracticalBreaks,
+  resolveShadowLevelCount,
+} from "../mobileShadowTier.js";
 
 const _ownerWorld = new THREE.Matrix4();
 const _inverseOwnerWorld = new THREE.Matrix4();
@@ -182,6 +190,8 @@ export class LightComponent extends Component {
     this.unsubRendererRebuilt = null;
     this.unsubShadowTypeSetting?.();
     this.unsubShadowTypeSetting = null;
+    this.unsubPlatform?.();
+    this.unsubPlatform = null;
     // Clears shadow.shadowNode only when it is OUR CSM node. A gi-mode light
     // carries the GI module's node in that slot; blanking it here would be
     // meddling with another module's state, and it is unnecessary — the light
@@ -459,6 +469,24 @@ export class LightComponent extends Component {
         // against the replacement CSM node.
         this.light?.dispose?.();
       });
+      // The mobile shadow tier follows the platform (a phone at boot, the
+      // editor's Mobile preview). A different cascade/level count is a
+      // different compiled node — the same rebuild `csmCascades` takes. An
+      // authored variant already rebuilt through `onPropChanged` before this
+      // event fires, so it lands here with nothing left to change.
+      this.unsubPlatform = this.entity.engine.on?.("platform-changed", () => {
+        const node = this.#csm;
+        if (!this.light || !node) return;
+        const clipmap = node.isClipmapShadowNode === true;
+        const want = this.#shadowTier(clipmap ? "clipmapLevels" : "csmCascades").count;
+        if (want !== (clipmap ? node.levels : node.cascades)) {
+          this.onDetach();
+          this.#buildLight();
+        } else {
+          // Same count, possibly different split layout (implicit ↔ authored).
+          this.#updateCSMFrustums(true);
+        }
+      }) ?? null;
       this.#syncDirectionalTransform();
       this.#syncCSM();
     }
@@ -601,10 +629,7 @@ export class LightComponent extends Component {
       // while orbiting — see shadowFreeze.js. `shadowCamSnap` raises the
       // grid to a world-space step (default 0.5 m); 0 keeps legacy one-texel
       // behaviour.
-      _shadowRight.crossVectors(_direction, _worldUp);
-      if (_shadowRight.lengthSq() < 1e-8) _shadowRight.set(1, 0, 0);
-      else _shadowRight.normalize();
-      _shadowUp.crossVectors(_shadowRight, _direction).normalize();
+      shadowSnapBasis(_direction, _shadowRight, _shadowUp, _worldUp);
       const worldUnits = this.props.shadowCamSize * 2;
       const texelX = worldUnits / Math.max(1, this.props.shadowMapWidth);
       const texelY = worldUnits / Math.max(1, this.props.shadowMapHeight);
@@ -635,10 +660,7 @@ export class LightComponent extends Component {
       const snapWorld = Math.max(0, Number(this.props.shadowCamSnap) || 0, coverageFloor);
       const snapX = snapWorld > 0 ? Math.max(texelX, snapWorld) : texelX;
       const snapY = snapWorld > 0 ? Math.max(texelY, snapWorld) : texelY;
-      const projectedX = _shadowCentre.dot(_shadowRight);
-      const projectedY = _shadowCentre.dot(_shadowUp);
-      _shadowCentre.addScaledVector(_shadowRight, Math.round(projectedX / snapX) * snapX - projectedX);
-      _shadowCentre.addScaledVector(_shadowUp, Math.round(projectedY / snapY) * snapY - projectedY);
+      snapShadowCentre(_shadowCentre, _direction, _shadowRight, _shadowUp, snapX, snapY, 0);
       // ⚠⚠ THE THIRD AXIS, AND IT IS THE ONE THAT MATTERS FOR PERFORMANCE.
       //
       // The two snaps above quantize the centre only in the plane the shadow
@@ -660,8 +682,7 @@ export class LightComponent extends Component {
       // few metres — so the only effect is which slab of that interval the
       // casters sit in, with the camera parked at its midpoint below.
       const snapZ = snapWorld > 0 ? snapWorld : Math.max(texelX, texelY);
-      const projectedZ = _shadowCentre.dot(_direction);
-      _shadowCentre.addScaledVector(_direction, Math.round(projectedZ / snapZ) * snapZ - projectedZ);
+      snapShadowCentre(_shadowCentre, _direction, _shadowRight, _shadowUp, 0, 0, snapZ);
       // The orthographic shadow camera sees only forward along the light
       // direction. ⛔ NOT MIDWAY (09-14): a 100 m slab centred on the viewer
       // clipped every caster more than 50 m UP-SUN at the near plane — a ridge
@@ -763,12 +784,36 @@ export class LightComponent extends Component {
     );
   }
 
+  /**
+   * The cascade (`csmCascades`) or clipmap level (`clipmapLevels`) count this
+   * platform renders: the authored value, or the mobile tier's 2 on a phone
+   * without an authored variant for the key. Never written to props, so
+   * `toJSON` is unaffected. `__mobileShadowTier = false` disables the tier.
+   */
+  #shadowTier(key) {
+    const csm = key === "csmCascades";
+    return resolveShadowLevelCount({
+      key,
+      value: this.props[key],
+      variants: this.props.variants,
+      layers: globalThis.__mobileShadowTier === false ? null : this.entity?.engine?.platformLayers ?? null,
+      fallback: csm ? 4 : 3,
+      min: 2,
+      max: 4,
+      mobile: csm ? MOBILE_CSM_CASCADES : MOBILE_CLIPMAP_LEVELS,
+    });
+  }
+
   #clipmapConfig() {
     const finite = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+    const tier = this.#shadowTier("clipmapLevels");
+    const scale = THREE.MathUtils.clamp(finite(this.props.clipmapScale, 4), 2, 8);
     return {
-      levels: THREE.MathUtils.clamp(Math.round(finite(this.props.clipmapLevels, 3)), 2, 4),
+      levels: tier.count,
       nearSize: Math.max(1, finite(this.props.clipmapNearSize, 20)),
-      scale: THREE.MathUtils.clamp(finite(this.props.clipmapScale, 4), 2, 8),
+      // A reduced tier keeps the OUTERMOST coverage (the clipmap analogue of
+      // CSM keeping maxFar): the finest level is unchanged, the rest spread.
+      scale: tier.reduced ? coveragePreservingClipmapScale(scale, tier.authored, tier.count) : scale,
       lightMargin: Math.max(0, finite(this.props.clipmapLightMargin, 200)),
       cache: this.props.clipmapCache !== false,
     };
@@ -833,7 +878,7 @@ export class LightComponent extends Component {
         (this.entity.engine.clipmapShadowNodes ??= new Set()).add(this.#csm);
       } else {
         this.#csm = new EngineCSMShadowNode(this.light, {
-          cascades: Math.min(4, Math.max(2, Math.round(this.props.csmCascades))),
+          cascades: this.#shadowTier("csmCascades").count,
           maxFar: Math.max(1, this.props.csmMaxFar),
           mode: this.props.csmMode === "practical" ? "custom" : this.props.csmMode,
           lightMargin: Math.max(0, this.props.csmLightMargin),
@@ -881,6 +926,13 @@ export class LightComponent extends Component {
     this.#csm.mode = "custom";
     this.#csm.customSplitsCallback = (cascades, near, far, target) => {
       const lambda = THREE.MathUtils.clamp(this.props.csmSplitLambda, 0, 1);
+      // Mobile tier: keep the authored layout's near splits (desktop texel
+      // density up close) and let the last cascade still reach maxFar.
+      const tier = this.#shadowTier("csmCascades");
+      if (tier.reduced && cascades === tier.count) {
+        target.push(...reducedPracticalBreaks(cascades, tier.authored, near, far, lambda));
+        return;
+      }
       for (let i = 1; i <= cascades; i++) {
         const p = i / cascades;
         const uniform = (near + (far - near) * p) / far;

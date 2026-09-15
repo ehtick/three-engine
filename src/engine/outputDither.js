@@ -27,14 +27,20 @@
 // Triangular PDF (two independent uniforms, minus one) rather than a single
 // uniform: it decorrelates the error from the signal, which is what removes the
 // residual pattern instead of just softening it.
-import { Fn, float, fract, sin, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, dot, fract, vec2, vec3, vec4 } from "three/tsl";
 import { screenCoordinate } from "three/tsl";
 
 /** One LSB of an 8-bit channel. */
 const LSB = 1 / 255;
 
-const hash = (p, seed) =>
-  fract(sin(p.dot(vec2(seed.x, seed.y))).mul(seed.z));
+/** Two decorrelated uniforms in [0,1) per pixel — Dave Hoskins' hash22 ("hash
+ * without sine"). The old `fract(sin(dot)·43758)` leaned on float32 `sin`
+ * precision, which some mobile GPUs lack (visible stipple structure). */
+const hash22 = (p) => {
+  const q = fract(vec3(p.x, p.y, p.x).mul(vec3(.1031, .1030, .0973)));
+  const r = q.add(dot(q, q.yzx.add(33.33)));
+  return fract(vec2(r.x.add(r.y).mul(r.z), r.x.add(r.z).mul(r.y)));
+};
 
 /**
  * Wraps `renderer._nodes.getOutputNode` so every output-transform quad three
@@ -57,9 +63,8 @@ export function installOutputDither(renderer) {
       const color = vec4(base).toVar();
       const p = vec2(screenCoordinate.x, screenCoordinate.y);
       // Two decorrelated uniforms → triangular PDF in [-1, 1] LSB.
-      const n1 = hash(p, vec3(12.9898, 78.233, 43758.5453));
-      const n2 = hash(p, vec3(39.3468, 11.1352, 24634.6345));
-      const d = float(n1).add(n2).sub(1).mul(LSB);
+      const n = hash22(p);
+      const d = n.x.add(n.y).sub(1).mul(LSB);
       return vec4(vec3(color.rgb).add(d), color.a);
     })();
   };

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Download, Globe, Loader2, Power, Search } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
@@ -57,6 +57,12 @@ export function AmbientCGPanel() {
   const [items, setItems] = useState(null); // null = loading, [] = loaded
   const [error, setError] = useState(null);
   const [query, setQuery] = useState("");
+  // The search input is bound directly to `query`; the local name + tags
+  // substring filter over `items` consumes `deferredQuery` and is allowed
+  // to lag a frame. The network fetch already runs on a setTimeout debounce
+  // (see loadEffect), so deferring the local filter here is what keeps the
+  // box from chunking on the index snapshot.
+  const deferredQuery = useDeferredValue(query);
   const [category, setCategory] = useState("");
   const [shown, setShown] = useState(PAGE);
   const [selectedId, setSelectedId] = useState(null);
@@ -103,7 +109,7 @@ export function AmbientCGPanel() {
 
   const filtered = useMemo(() => {
     if (!items) return [];
-    const q = query.trim().toLowerCase();
+    const q = deferredQuery.trim().toLowerCase();
     return items.filter(
       (item) =>
         (!category || item.category === category) &&
@@ -111,7 +117,7 @@ export function AmbientCGPanel() {
           item.name.toLowerCase().includes(q) ||
           item.tags?.some((t) => t.toLowerCase().includes(q))),
     );
-  }, [items, query, category]);
+  }, [items, deferredQuery, category]);
 
   const selected = useMemo(
     () => (selectedId ? (items ?? []).find((i) => i.id === selectedId) : null),

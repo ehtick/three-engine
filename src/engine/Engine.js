@@ -5,10 +5,14 @@ import { installGpuTimestampRetention } from "./gpuTimestampRetention.js";
 import { drsBudgetMs } from "./dynamicResolution.js";
 import { installDirectOutput, withRealOutput } from "./outputTransform.js";
 
-// Keep Three's URL-level FileLoader results for the lifetime of the engine.
-// Large scenes reuse texture/model URLs across components and scene reloads;
-// the default-disabled cache otherwise repeats the same fetch/decode inputs.
-// Asset edits resolve to a fresh blob URL, so editor invalidation stays exact.
+// Three's URL-level loader cache (raw file bytes / decoded images, keyed
+// `file:<url>`, `image:<url>`…). Kept on so components that fetch the same URL
+// within one load share a request — but it is a plain object nothing evicts,
+// so every fetched GLB and image used to stay in memory for the session. The
+// scene manager now clears it on each single-mode unload (`clearFileCache`):
+// parsed models and textures own their own reuse, and the previous level's
+// raw bytes are dead weight. r185's Cache refuses blob: keys itself
+// (`isBlobURL`), so editor asset edits never land here.
 THREE.Cache.enabled = true;
 import { EventEmitter } from "./EventEmitter.js";
 import { disposeEngineModules } from "./modules.js";
@@ -36,6 +40,7 @@ import { TimeSystem } from "./time.js";
 import { configureTextureAssetLoader } from "./textureAsset.js";
 import { installOutputDither } from "./outputDither.js";
 import { installShadowNodeGuard } from "./shadowNodeGuard.js";
+import { installReversedDepthGuards, installReversedSkyDepthTest } from "./reversedDepth.js";
 import { BatchSystem } from "./batching.js";
 import { MergeSystem } from "./merging.js";
 import { ShadowMergeSystem } from "./shadowMerge.js";
@@ -54,6 +59,47 @@ import { AssetRegistry } from "./assets/AssetRegistry.js";
 import { EventRegistry } from "./events/EventRegistry.js";
 import { math } from "./math/index.js";
 import { platformLayers } from "./componentVariants.js";
+
+/**
+ * Runs a render override (the postprocess pipeline) with the canvas
+ * single-sampled. The pipeline renders the scene into its own 1× PassNode
+ * target and only draws a full-screen quad onto the canvas, so a 4× canvas
+ * there bought a 4× colour + depth attachment and a resolve per frame for
+ * zero geometric smoothing.
+ *
+ * three reads `_samples` per render (`currentSamples`) and DESTROYS and
+ * re-creates the canvas colour/depth attachments whenever it differs from the
+ * last canvas render (WebGPUTextureUtils getColorBuffer) — its own XRManager
+ * swaps it the same way. So the window spans the override AND the postRender
+ * callbacks: a camera-preview PIP drawn onto the canvas at 4× after a 1× post
+ * frame would re-create both attachments twice a frame, and the fresh 4×
+ * buffer's resolve would black out the post image around the PIP.
+ * Returns the samples to restore, or null when there is nothing to swap.
+ * `__enginePostCanvasMsaa = true` restores the 4× canvas.
+ */
+function enterSingleSampleCanvas(renderer) {
+  const samples = renderer?._samples;
+  if (!(samples > 0) || globalThis.__enginePostCanvasMsaa === true) return null;
+  renderer._samples = 0;
+  return samples;
+}
+
+/**
+ * The tone-mapping frame buffer target freezes the sample count it was CREATED
+ * with (a postRender render inside the 1× window can create it). On a direct
+ * frame, drop one whose count no longer matches so MSAA comes back after post
+ * is switched off — a no-op Map check on every other frame.
+ */
+function dropStaleFrameBufferTargets(renderer) {
+  const targets = renderer?._frameBufferTargets;
+  if (!targets?.size) return;
+  for (const [owner, target] of targets) {
+    if ((target.samples ?? 0) !== (renderer.samples ?? 0)) {
+      target.dispose();
+      targets.delete(owner);
+    }
+  }
+}
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -326,6 +372,10 @@ export class Engine extends EventEmitter {
     // shadowNodeGuard.js for the verbatim three source and why neither shadow
     // flag can avoid it.
     installShadowNodeGuard();
+    // Rewrites three's addon sky tests (`rawDepth >= 1.0`) for a reversed
+    // depth buffer at node build time; inert unless the renderer is reversed.
+    // Prototype-level like the guard above. See reversedDepth.js.
+    installReversedSkyDepthTest();
     // Built-in per-frame telemetry sampler. Lives on the engine — every
     // engine has one, no module registry involved. The editor's viewport
     // overlay reads `engine.stats.readout`; built games can ignore it.
@@ -340,7 +390,10 @@ export class Engine extends EventEmitter {
     // Host-tunable runtime behavior (the editor writes project settings here).
     // `quality` is the build's preset name (see QUALITY_PRESETS); null in the
     // editor, where scenes are shown exactly as authored.
-    this.config = { scriptHotReload: true, scriptReloadIntervalMs: 750, saveVersion: 1, quality: null };
+    // `trackTimestamp`: GPU timestamp queries (decided at renderer construction;
+    // the player turns them off). `prewarmBlocking`: scene loads wait for
+    // `prewarmShaders` before announcing the scene (the player's loading screen).
+    this.config = { scriptHotReload: true, scriptReloadIntervalMs: 750, saveVersion: 1, quality: null, trackTimestamp: true, prewarmBlocking: false };
 
     // Save slots (a playthrough) and preferences (settings, cross-run flags).
     // Deliberately separate: deleting every save must not reset the volume.
@@ -423,8 +476,9 @@ export class Engine extends EventEmitter {
     // THE FREEZE LEDGER (docs/ZERO_FREEZE_PLAN.md Stage 0). Armed for the
     // engine's whole life, not for a capture window: the freezes worth naming
     // are the ones nobody was watching for. Costs a browser-side observer that
-    // only calls back when the main thread actually blocked.
-    installFreezeObserver();
+    // only calls back when the main thread actually blocked. Not in a player
+    // that switched the ledger off (player/main.js) — nothing reads it there.
+    if (freeze.enabled) installFreezeObserver();
   }
 
   /**
@@ -643,7 +697,7 @@ export class Engine extends EventEmitter {
       && rendererNeedsRebuild(before.renderer, this.settings.renderer);
     if (optionCheckScheduled && fromSceneLoad && globalThis.__engineSceneSwitchRebuildsRenderer !== true) {
       const built = this._rendererBuiltWith ?? {};
-      const wanted = rendererConstructorOptions(this.settings);
+      const wanted = rendererConstructorOptions(this.settings, this.config);
       const diff = Object.keys(wanted)
         .filter((key) => wanted[key] !== built[key])
         .map((key) => `${key} ${String(built[key])}→${String(wanted[key])}`)
@@ -709,7 +763,7 @@ export class Engine extends EventEmitter {
   async #applyRendererOptionsIfChanged() {
     if (!this.renderer) return;
     const built = this._rendererBuiltWith;
-    const wanted = rendererConstructorOptions(this.settings);
+    const wanted = rendererConstructorOptions(this.settings, this.config);
     const changed = !built
       || Object.keys(wanted).some((key) => wanted[key] !== built[key]);
     if (!changed) return;
@@ -911,12 +965,15 @@ export class Engine extends EventEmitter {
    */
   async #rebuildRendererOnce(canvas, token, wasWebGPU, attempt) {
     try {
-        const opts = rendererConstructorOptions(this.settings);
+        const opts = rendererConstructorOptions(this.settings, this.config);
         // Adapter-clamped limit bump — see resolveRendererLimits. Awaited
         // BEFORE construction because `requiredLimits` is a constructor
         // parameter three forwards straight to requestDevice.
         const limits = await resolveRendererLimits();
         this.renderer = new THREE.WebGPURenderer({ canvas, ...opts, ...limits });
+        // Polygon-offset sign + float framebuffer depth for reversed depth.
+        // Before init(): the first pipeline and framebuffer target come after.
+        installReversedDepthGuards(this.renderer);
         refuseWebGLFallback(this.renderer, wasWebGPU);
         // What this renderer actually froze — the baseline the coalesced
         // option check compares against (see #applyRendererOptionsIfChanged).
@@ -941,9 +998,13 @@ export class Engine extends EventEmitter {
         this.#watchDevice();
         // …and its own freeze-ledger wrappers: the wrappers live on the
         // GPUDevice, so a swap silently loses them.
+        // (The device ledger always installs — it keeps WGSL interning and
+        // the async in-flight count — and skips its hot wrappers when off.)
         installGpuCallLedger(this.renderer?.backend?.device);
-        installNodeBuildLedger(this.renderer);
-        installRenderSpans(this.renderer);
+        if (freeze.enabled) {
+          installNodeBuildLedger(this.renderer);
+          installRenderSpans(this.renderer);
+        }
         this.emit("renderer-ready", this.renderer);
         configureTextureAssetLoader(this.renderer);
     // Sub-LSB dither on the output transform — without it every smooth GI
@@ -1217,13 +1278,15 @@ export class Engine extends EventEmitter {
     // awaiting init() will notice and abort instead of clobbering us.
     ++this._rendererRebuildSeq;
     // See #applyRendererOptionsIfChanged for why the built options are kept.
-    this._rendererBuiltWith = rendererConstructorOptions(this.settings);
+    this._rendererBuiltWith = rendererConstructorOptions(this.settings, this.config);
     freeze.bootStage("renderer: construct");
     this.renderer = new THREE.WebGPURenderer({
       canvas,
       ...this._rendererBuiltWith,
       ...(await resolveRendererLimits()),
     });
+    // Polygon-offset sign + float framebuffer depth for reversed depth. See reversedDepth.js.
+    installReversedDepthGuards(this.renderer);
     this.#applyRendererSize();
     await this.renderer.init();
     freeze.bootStage(null);
@@ -1233,9 +1296,15 @@ export class Engine extends EventEmitter {
     // named span in the freeze ledger. Installed on the DEVICE (not the
     // renderer) so it survives three's internal re-wrapping, and re-armed
     // after every device swap because a rebuild hands us a new one.
+    // The device ledger always installs (WGSL interning and the async
+    // in-flight count are functional) and skips its per-call wrappers when the
+    // ledger is off; the per-object node-build and render spans are pure
+    // instrumentation and only install with it on.
     installGpuCallLedger(this.renderer?.backend?.device);
-    installNodeBuildLedger(this.renderer);
-    installRenderSpans(this.renderer);
+    if (freeze.enabled) {
+      installNodeBuildLedger(this.renderer);
+      installRenderSpans(this.renderer);
+    }
     // What this session actually got. A rebuild after a device loss insists on
     // the same backend rather than accepting a WebGL fallback the canvas
     // cannot serve — see #rebuildRenderer's header.
@@ -1692,8 +1761,13 @@ export class Engine extends EventEmitter {
         // setRenderTarget calls).
           // The override's pipeline reads the REAL tone mapping for its own
           // output pass (three swaps them around its quad itself).
+          // 1× canvas from here through the postRender callbacks (see
+          // enterSingleSampleCanvas); closed after them.
+          this.#singleSampleRestore ??= enterSingleSampleCanvas(this.renderer);
           withRealOutput(this.renderer, () => override.render(this));
         } else {
+          this.#exitSingleSampleCanvas();
+          dropStaleFrameBufferTargets(this.renderer);
           this.renderer.render(this.scene, this.camera);
         }
       } finally {
@@ -1750,6 +1824,7 @@ export class Engine extends EventEmitter {
     } else {
       for (const fn of this.postRenderCallbacks) { if (!this.#muted(fn)) fn(); }
     }
+    this.#exitSingleSampleCanvas();
     this.stats.endPhaseFrame();
     this.stats.recordFrameWorkMs(performance.now() - frameStarted);
   }
@@ -2308,6 +2383,108 @@ export class Engine extends EventEmitter {
    */
   loadScene(ref, options) {
     return this.scenes.load(ref, options);
+  }
+
+  /**
+   * Drops three's URL loader cache (see the Cache note at the top of this
+   * file). Parsed models and textures are untouched; the next fetch of a URL
+   * goes back to the network / HTTP cache.
+   */
+  clearFileCache() {
+    THREE.Cache.clear();
+  }
+
+  /**
+   * Compiles the current scene's render pipelines before the frames that need
+   * them. Without it the presenting render skips every draw whose async
+   * pipeline has not landed (asyncRenderPipelines.js), so a fresh level pops in
+   * over its first frames, and anything outside the load-time frustum pays its
+   * compile the first time the camera turns to it.
+   *
+   * Skipped when GI owns the warm-up (its compile wave builds every material
+   * against the GI light it injects; warming first would build graphs that
+   * wave throws away) and when a render override owns the camera (the scene
+   * then renders through the postprocess PassNode's own target and MRT, so a
+   * canvas-context compile builds programs that frame never uses).
+   *
+   * Time-bounded: resolves `"timeout"` after `timeoutMs` while the compile
+   * carries on in the background, so a stuck driver cannot hold a loading
+   * screen. Node builds inside three's `compileAsync` already yield between
+   * objects. `__enginePrewarm = false` disables it.
+   *
+   * @param {{ timeoutMs?: number, reason?: string }} [options]
+   * @returns {Promise<{ status: string, ms?: number }>}
+   */
+  async prewarmShaders({ timeoutMs = 20000, reason = "" } = {}) {
+    const renderer = this.renderer;
+    const scene = this.scene;
+    const camera = this.camera;
+    if (globalThis.__enginePrewarm === false) return { status: "disabled" };
+    if (!renderer?.compileAsync || !this.rendererReady || !scene || !camera) return { status: "no-renderer" };
+    if (this.#giOwnsWarmup()) return { status: "gi" };
+    if (this.#activeRenderOverride()) return { status: "override" };
+    const t0 = performance.now();
+    // three's compileAsync frustum-culls in its synchronous projection, so an
+    // object outside this camera compiles nothing (GISystem's wave hit the
+    // same wall). Lift the flag for exactly that synchronous part; the promise
+    // covers node builds and driver compiles of render objects already listed.
+    const lifted = [];
+    scene.traverseVisible((object) => {
+      if (object.frustumCulled === true && (object.isMesh || object.isPoints || object.isLine || object.isSprite)) {
+        object.frustumCulled = false;
+        lifted.push(object);
+      }
+    });
+    const span = freeze.begin("prewarm:compileAsync");
+    let compile;
+    try {
+      compile = renderer.compileAsync(scene, camera);
+    } catch (error) {
+      compile = Promise.reject(error);
+    } finally {
+      freeze.end(span);
+      for (const object of lifted) object.frustumCulled = true;
+    }
+    let timer = null;
+    const outcome = await Promise.race([
+      compile.then(
+        () => "done",
+        (error) => {
+          console.warn(`[engine] shader prewarm failed: ${error?.message ?? error}`);
+          return "error";
+        },
+      ),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      }),
+    ]);
+    clearTimeout(timer);
+    const ms = performance.now() - t0;
+    const label = reason ? ` (${reason})` : "";
+    if (outcome === "timeout") {
+      console.warn(`[engine] shader prewarm${label} still compiling after ${(ms / 1000).toFixed(1)} s — continuing without waiting`);
+    } else if (outcome === "done" && ms >= 250) {
+      console.log(`[engine] shader prewarm${label}: ${ms.toFixed(0)} ms`);
+    }
+    return { status: outcome, ms };
+  }
+
+  /** Canvas samples saved by enterSingleSampleCanvas for this frame, or null. */
+  #singleSampleRestore = null;
+
+  #exitSingleSampleCanvas() {
+    if (this.#singleSampleRestore == null) return;
+    if (this.renderer) this.renderer._samples = this.#singleSampleRestore;
+    this.#singleSampleRestore = null;
+  }
+
+  /** An enabled GI component means GI's own compile wave warms materials. */
+  #giOwnsWarmup() {
+    if (!this.modules?.has?.("gi")) return false;
+    for (const entity of this.entities.values()) {
+      if (entity.getComponent?.("global-illumination")?.enabled) return true;
+    }
+    return false;
   }
 
   /** Removes an additively-loaded scene. */

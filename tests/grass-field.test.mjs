@@ -953,12 +953,21 @@ test('the hex lattice point and jitter agree with an independently-written refer
   // still "look like a lattice" on their own — same pattern as the simplex
   // cross-check above, applied to the new hex derivation.
   const ratio = Math.sqrt(3) / 2;
-  const refFrac = value => value - Math.floor(value);
+  // Reference hash22 without sine (Dave Hoskins), written out in float32 the way
+  // the shader evaluates `fract(p.xyx·k)`, `p3 += dot(p3, p3.yzx + 33.33)`,
+  // `fract((p3.xx + p3.yz)·p3.zy)`.
+  const F = Math.fround, refFrac = value => F(value - Math.floor(value));
+  function referenceHash22(px, py) {
+    const p3 = [refFrac(F(F(px) * F(.1031))), refFrac(F(F(py) * F(.1030))), refFrac(F(F(px) * F(.0973)))];
+    const k = F(33.33);
+    const shift = F(F(F(p3[0] * F(p3[1] + k)) + F(p3[1] * F(p3[2] + k))) + F(p3[2] * F(p3[0] + k)));
+    const [x, y, z] = p3.map(v => F(v + shift));
+    return [refFrac(F(F(x + y) * z)), refFrac(F(F(x + z) * y))];
+  }
   function referenceBladeXZ(cell, col, row) {
     const parity = ((row % 2) + 2) % 2;
     const x0 = (col + .5 * parity) * cell, z0 = row * cell * ratio;
-    const u1 = refFrac(Math.sin(col * 127.1 + row * 311.7) * 43758.5453);
-    const u2 = refFrac(Math.sin(col * 269.5 + row * 183.3) * 24634.6345);
+    const [u1, u2] = referenceHash22(col, row);
     const r = Math.sqrt(u1) * cell * .45, theta = u2 * Math.PI * 2;
     return [x0 + Math.cos(theta) * r, z0 + Math.sin(theta) * r];
   }

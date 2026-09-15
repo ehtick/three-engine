@@ -12,6 +12,7 @@ import {
   loadAddonsForGraph,
 } from "./postGraph.js";
 import { freeze } from "../../engine/freezeLedger.js";
+import { passSampleCount } from "../../engine/sceneSettings.js";
 
 /**
  * Disposes one stashable pipeline bundle — the live pipeline's, a stashed
@@ -1268,9 +1269,12 @@ export class PostprocessComponent extends Component {
         depthNode,
         normalNode,
         velocityNode,
-        msaaEnabled:
-          engine.settings?.renderer?.antialias !== false &&
-          (engine.settings?.renderer?.samples ?? 4) > 1,
+        // The SCENE PASS's samples, not the renderer setting: the pass is
+        // forced to 1× (see its construction), and the engine drops the
+        // canvas to 1× while this pipeline presents, so renderer MSAA never
+        // touches what TRAA reprojects. Gating on the setting blocked TRAA
+        // on every default scene for nothing.
+        msaaEnabled: passSampleCount(this.scenePass?.options, renderer.samples) > 1,
         metalnessNode,
         roughnessNode,
         metalTintNode,

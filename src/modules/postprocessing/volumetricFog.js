@@ -211,6 +211,15 @@ const henyeyGreenstein = (cosTheta, g) => {
  *                                         "gaussian"; null falls back to raw).
  * @returns {{ color: Node, fog: Node, setParams: Function, tick: Function, time: Node, passes: Node[] }}
  */
+/**
+ * "This pixel has geometry" for a raw depth sample: short of the cleared far
+ * value, which is 1 normally and 0 under a reversed buffer. Exported for the
+ * per-flag gate.
+ */
+export function fogSurfaceTest(depth, reversed) {
+  return reversed ? depth.greaterThan(0.0001) : depth.lessThan(0.9999);
+}
+
 export function volumetricFog({ colorNode, depthNode, camera, params = {}, light = null, gaussianBlur = null }) {
   const P = { ...VOLUMETRIC_FOG_DEFAULTS, ...params };
 
@@ -335,7 +344,8 @@ export function volumetricFog({ colorNode, depthNode, camera, params = {}, light
 
   // --- the march (runs at `resolutionScale`) --------------------------------
 
-  const fogPass = TSL.Fn(() => {
+  // Zero-parameter Fn: three calls it with the builder (TSLCore `jsFunc(builder)`).
+  const fogPass = TSL.Fn((builder) => {
     const depth = depthNode.sample(TSL.screenUV).r;
     const viewPos = TSL.getViewPosition(TSL.screenUV, depth, projInv);
     const targetWorldPos = camWorld.mul(TSL.vec4(viewPos, 1.0)).xyz;
@@ -418,14 +428,15 @@ export function volumetricFog({ colorNode, depthNode, camera, params = {}, light
     // in a visible wall at `maxRayDist`.
     //
     // ⚠ NOT ON THE SKY. A pixel with nothing in it carries the cleared depth
-    // (1.0 — this renderer does not use a reversed buffer), which reads as
+    // (1.0, or 0.0 under `renderer.reversedDepth` — resolved at build), which reads as
     // "a surface at the far plane" and drives the range term to 1, painting
     // the whole background flat fog-colour. three's example never notices
     // because ITS background is already white; measured here on a normal dark
     // sky it was the difference between ground fog and a whiteout. The cloud
     // march still runs on those pixels, so the fog bank is still visible
     // against the horizon — which is the point of it.
-    const hasSurface = depth.lessThan(0.9999).select(TSL.float(1.0), TSL.float(0.0));
+    const hasSurface = fogSurfaceTest(depth, builder?.renderer?.reversedDepthBuffer === true)
+      .select(TSL.float(1.0), TSL.float(0.0));
     const rangeFog = surfaceDist
       .sub(U.rangeFogNear)
       .div(U.rangeFogFar.sub(U.rangeFogNear).max(0.001))

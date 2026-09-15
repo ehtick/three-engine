@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Download, ExternalLink, Loader2, Power, Search, Swords } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
@@ -26,6 +26,10 @@ export function KayKitPanel() {
   // The characters are the point — open on the pack that has them.
   const [packId, setPackId] = useState(PACKS[0].id);
   const [query, setQuery] = useState("");
+  // The search input is bound directly to `query`; the local name filter
+  // over `items` consumes `deferredQuery` and is allowed to lag a frame.
+  // Per-pack file lists can run into hundreds of GLBs.
+  const deferredQuery = useDeferredValue(query);
   const [items, setItems] = useState(null);
   const [error, setError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
@@ -51,9 +55,9 @@ export function KayKitPanel() {
   }, [packId, query]);
 
   const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
+    const needle = deferredQuery.trim().toLowerCase();
     return (items ?? []).filter((item) => !needle || item.name.toLowerCase().includes(needle));
-  }, [items, query]);
+  }, [items, deferredQuery]);
   const selected = (items ?? []).find((item) => item.id === selectedId) ?? null;
 
   if (!moduleOn) {

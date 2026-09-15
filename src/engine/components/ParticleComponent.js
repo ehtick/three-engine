@@ -32,9 +32,12 @@ import {
 import { ParticleColliderField } from "../particleColliders.js";
 import { registerGiEmitter } from "../giEmitters.js";
 import { bindVfxAsset, vfxRuntimeGraph } from "../vfx/vfxAsset.js";
+import { particleLightPool } from "../vfx/particleLightPool.js";
 
 const MAX_CAPACITY = 200_000;
 const GRID_SLOTS = 4;
+/** Virtual light clusters per subsystem. The REAL lights are a scene-wide
+ *  fixed budget owned by `particleLightPool.js`. */
 const MAX_LIGHTS = 8;
 const LIGHT_SAMPLES = 128; // particles read back per frame to place the lights
 
@@ -589,23 +592,32 @@ export class ParticleComponent extends Component {
       sampleBuffer.element(instanceIndex.mul(2).add(1)).assign(vec4(rgb, 0));
     })().compute(samples);
 
-    const lights = [];
+    // ⭐ VIRTUAL CLUSTERS, NOT LIGHTS (2026-09-14). Each one used to be a real
+    // PointLight parented here — building or destroying a system then moved the
+    // scene's lights hash and re-minted every lit material, and 8 per subsystem
+    // added per-fragment cost everywhere. The pool maps the brightest clusters
+    // scene-wide onto a fixed budget of lights (see particleLightPool.js).
+    const clusters = [];
     for (let i = 0; i < count; i++) {
-      const light = new THREE.PointLight(0xffffff, 0, s.lightDistance ?? 6, 2);
-      light.userData.engineOwned = true;
-      light.raycast = () => {};
-      // Seed positions spread out so clusters don't all collapse into one.
-      light.position.set(Math.cos((i / count) * Math.PI * 2) * 0.5, 0.5, Math.sin((i / count) * Math.PI * 2) * 0.5);
-      this.entity.object3D.add(light);
-      lights.push(light);
+      clusters.push({
+        // Seed positions spread out so clusters don't all collapse into one.
+        position: new THREE.Vector3(Math.cos((i / count) * Math.PI * 2) * 0.5, 0.5, Math.sin((i / count) * Math.PI * 2) * 0.5),
+        color: new THREE.Color(1, 1, 1),
+        intensity: 0,
+        distance: s.lightDistance ?? 6,
+        world: new THREE.Vector3(),
+      });
     }
 
-    return {
+    const rig = {
       count,
       samples,
       sampleBuffer,
       sampleCompute,
-      lights,
+      clusters,
+      object: this.entity.object3D,
+      active: this._enabled !== false,
+      releaseLights: null,
       readPending: false,
       giEmission,
       // Published to the GI module's per-frame emitter slot. Null until the
@@ -616,6 +628,9 @@ export class ParticleComponent extends Component {
       // scratch accumulators reused every frame (no per-frame allocation)
       accum: new Float32Array(Math.max(1, count) * 7), // x,y,z,r,g,b,weight per cluster
     };
+    // No lights at all unless a system asks for them (lightCount > 0).
+    if (count) rig.releaseLights = particleLightPool(this.entity.engine).acquire(rig);
+    return rig;
   }
 
   /** One async readback + one k-means relaxation; updates the point lights. */
@@ -631,7 +646,7 @@ export class ParticleComponent extends Component {
         if (generation !== this.generation) return; // component rebuilt meanwhile
         const data = new Float32Array(buffer);
         const s = sub.sysProps;
-        const { count, lights, accum } = rig;
+        const { count, clusters, accum } = rig;
         accum.fill(0);
 
         // Aggregate the whole cloud into ONE emitter shape for GI: weighted
@@ -668,7 +683,7 @@ export class ParticleComponent extends Component {
           let best = 0;
           let bestDist = Infinity;
           for (let k = 0; k < count; k++) {
-            const lp = lights[k].position;
+            const lp = clusters[k].position;
             const dx = lp.x - x;
             const dy = lp.y - y;
             const dz = lp.z - z;
@@ -732,7 +747,8 @@ export class ParticleComponent extends Component {
         for (let k = 0; k < count; k++) {
           const a = k * 7;
           const w = accum[a + 6];
-          const light = lights[k];
+          // Same smoothing as when these were real lights; the pool copies them.
+          const light = clusters[k];
           light.distance = s.lightDistance ?? 6;
           if (w <= 1e-4 || total <= 1e-4) {
             light.intensity += (0 - light.intensity) * 0.2; // fade out empty clusters
@@ -775,10 +791,8 @@ export class ParticleComponent extends Component {
       // Drops this system's GI emitter slot; without it a destroyed effect
       // keeps lighting the scene from a provider closure nothing can reach.
       sub.unregisterGiEmitter?.();
-      for (const light of sub.lightRig?.lights ?? []) {
-        this.entity.object3D.remove(light);
-        light.dispose();
-      }
+      // Hands the rig's clusters back; the pool's lights stay (fixed count).
+      sub.lightRig?.releaseLights?.();
     }
     this.subsystems = [];
     this.compiled = null;
@@ -803,16 +817,18 @@ export class ParticleComponent extends Component {
   onDisable() {
     // Hide the render objects and skip the GPU compute pass — both
     // contribute meaningfully to cost when a particle system is offscreen.
+    // ⛔ Not `light.visible`: that moves the lights hash. An inactive rig just
+    // stops offering clusters and the pool fades its lights to 0.
     for (const sub of this.subsystems ?? []) {
       sub.object.visible = false;
-      for (const light of sub.lightRig?.lights ?? []) light.visible = false;
+      if (sub.lightRig) sub.lightRig.active = false;
     }
   }
 
   onEnable() {
     for (const sub of this.subsystems ?? []) {
       sub.object.visible = true;
-      for (const light of sub.lightRig?.lights ?? []) light.visible = true;
+      if (sub.lightRig) sub.lightRig.active = true;
     }
   }
 

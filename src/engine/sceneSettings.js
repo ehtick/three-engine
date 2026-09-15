@@ -54,8 +54,12 @@ export const SCENE_SETTINGS_DEFAULTS = {
   // MSAA state at init time). Engine.applySettings handles that.
   renderer: {
     antialias: true,
-    samples: 4, // MSAA samples (1, 2, 4, 8, ...). Ignored when antialias=false.
+    samples: 4, // MSAA samples: 1 or 4 (WebGPU's only portable counts). Ignored when antialias=false.
     transparent: false, // alpha channel on the canvas (see-through vs opaque)
+    // Reversed depth buffer: far-range precision for km-scale scenes (distant
+    // z-fighting). Opt-in; see engine/reversedDepth.js for what the engine
+    // patches on top of three's own support.
+    reversedDepth: false,
   },
   // Shadow caster configuration. These are global defaults applied to the
   // renderer's shadow map — per-light overrides live on each LightComponent.
@@ -380,7 +384,8 @@ export const SHADOW_TYPES = {
 };
 
 // MSAA sample counts worth offering. 0 = "off" (handled by antialias=false).
-export const MSAA_SAMPLES = [1, 2, 4, 8, 16];
+// WebGPU only guarantees 1× and 4× — see `effectiveMsaaSamples`.
+export const MSAA_SAMPLES = [1, 4];
 
 /**
  * Renderer-construction options are those that WebGPU/WebGL fix at creation
@@ -388,7 +393,7 @@ export const MSAA_SAMPLES = [1, 2, 4, 8, 16];
  * re-init it. Engine.applySettings compares the new vs current values and
  * triggers a re-init when this set changes.
  */
-export const RENDERER_REBUILD_KEYS = ["antialias", "samples", "transparent"];
+export const RENDERER_REBUILD_KEYS = ["antialias", "samples", "transparent", "reversedDepth"];
 
 /** True iff two renderer sub-objects differ on any rebuild key. */
 export function rendererNeedsRebuild(a, b) {
@@ -432,23 +437,60 @@ export function mergeSettings(current, patch) {
  * trade-off is a brief pop-in for materials that haven't compiled yet
  * (they draw as black until ready) — acceptable for the boot speedup.
  */
-export function rendererConstructorOptions(settings) {
+export function rendererConstructorOptions(settings, host = null) {
   const r = settings.renderer ?? SCENE_SETTINGS_DEFAULTS.renderer;
+  const samples = effectiveMsaaSamples(r);
   return {
-    antialias: r.antialias !== false,
-    samples: r.antialias === false ? 0 : (r.samples ?? 4),
+    // three r185 folds these as `samples || antialias === true ? 4 : 0`
+    // (Renderer.js:275 — the `||` binds first), so any truthy pair meant 4×.
+    // Handing it the already-clamped count keeps `antialias` from overriding
+    // a 1× choice.
+    antialias: samples > 0,
+    samples,
     alpha: r.transparent !== false,
+    // Frozen at construction like MSAA (three picks canvas depth format, clear
+    // value and every pipeline's depth compare from it).
+    reversedDepthBuffer: r.reversedDepth === true,
     asyncCompilation: r.asyncCompilation !== false,
-    // Enables WebGPU timestamp queries so the engine can read real GPU
-    // frame time (renderer.info.render.timestamp) instead of guessing from
-    // CPU-side submit time. The backend degrades gracefully when the
-    // adapter lacks the "timestamp-query" feature (WebGPUBackend.js:294),
-    // so this is safe to request unconditionally. Overhead is negligible
-    // (two GPU timestamps + one tiny resolve buffer per pass).
-    // `__engineTrackTimestamp = false` (dev) prices that claim on a build:
-    // ~40 passes a frame each carry two timestamp writes and a resolve.
-    trackTimestamp: globalThis.__engineTrackTimestamp !== false,
+    // WebGPU timestamp queries: real GPU frame time for the stats overlay,
+    // the profile.* tools, DRS and the frame governor. Not free — every pass
+    // carries two timestamp writes and the engine resolves both pools each
+    // frame — so the HOST decides (`host.trackTimestamp`; the player turns it
+    // off unless `?hud=1` / `?timestamps=1`). `__engineTrackTimestamp`
+    // (true/false) overrides either way for A/Bs.
+    trackTimestamp: resolveTrackTimestamp(host?.trackTimestamp),
   };
+}
+
+/**
+ * The MSAA count the renderer can actually use. WebGPU only guarantees 1 and
+ * 4 (three's `WebGPUUtils.getSampleCount` rounds 2 down to 1 and 8/16 down to
+ * 4), so anything else is clamped here, where the rebuild check compares it.
+ * @param {{antialias?: boolean, samples?: number}} [renderer]
+ */
+export function effectiveMsaaSamples(renderer) {
+  if (renderer?.antialias === false) return 0;
+  const requested = renderer?.samples ?? 4;
+  return requested >= 4 ? 4 : 0;
+}
+
+/** Host default, then the dev global. Off only when someone says so. */
+export function resolveTrackTimestamp(hostValue) {
+  if (globalThis.__engineTrackTimestamp === false) return false;
+  if (globalThis.__engineTrackTimestamp === true) return true;
+  return hostValue !== false;
+}
+
+/**
+ * Sample count of a TSL `pass()` scene render as three resolves it:
+ * `PassNode.setup` takes `options.samples ?? renderer.samples`, and the WebGPU
+ * backend clamps to 1 or 4. TRAA must be gated on THIS, not on the scene's
+ * renderer setting — the postprocess scene pass is single-sampled whatever
+ * the canvas uses.
+ */
+export function passSampleCount(passOptions, rendererSamples) {
+  const samples = passOptions?.samples ?? rendererSamples ?? 0;
+  return samples >= 4 ? 4 : 1;
 }
 
 /**

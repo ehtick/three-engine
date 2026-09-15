@@ -389,4 +389,7 @@ export async function deserializeScene(engine, json) {
       engine.scene.visible = wasVisible;
     }
   });
+  // Editor scene open: compile what the scene will draw in the background.
+  // Never awaited — opening a scene must not wait on the driver.
+  void engine.prewarmShaders?.({ reason: "scene open" });
 }

@@ -1,0 +1,611 @@
+{
+  "framesCaptured": 3,
+  "drawsPerFrame": [
+    88,
+    88,
+    88
+  ],
+  "totalDraws": 88,
+  "submissions": 88,
+  "totalTriangles": 12148246,
+  "overlayDrawCalls": 90,
+  "unreportedByOverlay": -2,
+  "passes": [
+    {
+      "pass": "rt:888x622#",
+      "camera": "PerspectiveCamera",
+      "draws": 57,
+      "triangles": 6316568,
+      "distinctMaterials": 36,
+      "distinctGeometries": 42,
+      "floorIfMerged": 10,
+      "byMaterial": [
+        {
+          "material": "Foliage · living surface",
+          "draws": 6,
+          "triangles": 3518826,
+          "objects": [
+            "accent",
+            "accent",
+            "oak-elder",
+            "oak-elder",
+            "hazel-study",
+            "hazel-study"
+          ]
+        },
+        {
+          "material": "Foliage · living surface",
+          "draws": 4,
+          "triangles": 1002994,
+          "objects": [
+            "birch-tall",
+            "birch-tall",
+            "young-growth",
+            "young-growth"
+          ]
+        },
+        {
+          "material": "World landscape · natural layered stone",
+          "draws": 3,
+          "triangles": 41608,
+          "objects": [
+            "Cliffs and rocks",
+            "Cliffs and rocks",
+            "Cliffs and rocks"
+          ]
+        },
+        {
+          "material": "Foliage · living surface",
+          "draws": 2,
+          "triangles": 833264,
+          "objects": [
+            "oak-wide",
+            "oak-wide"
+          ]
+        },
+        {
+          "material": "Foliage · living surface",
+          "draws": 2,
+          "triangles": 248540,
+          "objects": [
+            "pine-tall",
+            "pine-tall"
+          ]
+        },
+        {
+          "material": "Foliage · living surface",
+          "draws": 2,
+          "triangles": 59235,
+          "objects": [
+            "bank-rushes",
+            "bank-rushes"
+          ]
+        },
+        {
+          "material": "Foliage · living surface",
+          "draws": 2,
+          "triangles": 339640,
+          "objects": [
+            "meadow-flowers",
+            "meadow-flowers"
+          ]
+        },
+        {
+          "material": "Architecture styled wall",
+          "draws": 2,
+          "triangles": 776,
+          "objects": [
+            "Cottage with side wing",
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Architecture styled roof",
+          "draws": 2,
+          "triangles": 680,
+          "objects": [
+            "Cottage with side wing",
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Architecture styled trim",
+          "draws": 2,
+          "triangles": 924,
+          "objects": [
+            "Cottage with side wing",
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Architecture styled stone",
+          "draws": 2,
+          "triangles": 1284,
+          "objects": [
+            "Cottage with side wing",
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Architecture styled glass",
+          "draws": 2,
+          "triangles": 204,
+          "objects": [
+            "Cottage with side wing",
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Architecture styled door",
+          "draws": 2,
+          "triangles": 156,
+          "objects": [
+            "Cottage with side wing",
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Architecture styled chimney",
+          "draws": 2,
+          "triangles": 128,
+          "objects": [
+            "Cottage with side wing",
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Background.material",
+          "draws": 1,
+          "triangles": 1984,
+          "objects": [
+            "Background.mesh"
+          ]
+        },
+        {
+          "material": "MeshPhysicalNodeMaterial#0d3615",
+          "draws": 1,
+          "triangles": 20840,
+          "objects": [
+            "Alpha_Joints"
+          ]
+        },
+        {
+          "material": "MeshPhysicalNodeMaterial#27b462",
+          "draws": 1,
+          "triangles": 34480,
+          "objects": [
+            "Body"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "bank-rushes"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "accent"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "pine-tall"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "oak-elder"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "oak-wide"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "birch-tall"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "young-growth"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "hazel-study"
+          ]
+        },
+        {
+          "material": "MeshStandardNodeMaterial#b458b5",
+          "draws": 1,
+          "triangles": 131072,
+          "objects": [
+            "Terrain"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "meadow-flowers"
+          ]
+        },
+        {
+          "material": "Grass field · natural",
+          "draws": 1,
+          "triangles": 3,
+          "objects": [
+            "Grass ring 0"
+          ]
+        },
+        {
+          "material": "Grass field · natural",
+          "draws": 1,
+          "triangles": 24,
+          "objects": [
+            "Grass ring 1"
+          ]
+        },
+        {
+          "material": "Grass field · natural",
+          "draws": 1,
+          "triangles": 12,
+          "objects": [
+            "Grass ring 2"
+          ]
+        },
+        {
+          "material": "Architecture floor",
+          "draws": 1,
+          "triangles": 12,
+          "objects": [
+            "Cottage with side wing"
+          ]
+        },
+        {
+          "material": "Architecture floor",
+          "draws": 1,
+          "triangles": 12,
+          "objects": [
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Architecture styled timber",
+          "draws": 1,
+          "triangles": 6120,
+          "objects": [
+            "Cottage"
+          ]
+        },
+        {
+          "material": "Atmosphere · rain",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "Atmosphere rain"
+          ]
+        },
+        {
+          "material": "Atmosphere · snow",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "Atmosphere snow"
+          ]
+        },
+        {
+          "material": "World study · depth and reflective water",
+          "draws": 1,
+          "triangles": 73728,
+          "objects": [
+            "River and lakes"
+          ]
+        }
+      ],
+      "splits": [
+        {
+          "state": "MeshStandardNodeMaterial|opaque|side0|noAlphaTest|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 21,
+          "distinctMaterials": 12
+        },
+        {
+          "state": "MeshStandardNodeMaterial|opaque|side2|alphaTest0.5|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 14,
+          "distinctMaterials": 4
+        },
+        {
+          "state": "MeshStandardNodeMaterial|opaque|side2|alphaTest0.35|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 7,
+          "distinctMaterials": 7
+        },
+        {
+          "state": "MeshStandardNodeMaterial|opaque|side2|alphaTest0.5|blend1|depthWrite|layers1|order0|noCast|receives",
+          "draws": 4,
+          "distinctMaterials": 2
+        },
+        {
+          "state": "MeshPhysicalNodeMaterial|opaque|side2|noAlphaTest|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 3,
+          "distinctMaterials": 3
+        },
+        {
+          "state": "MeshPhysicalNodeMaterial|opaque|side0|noAlphaTest|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 2,
+          "distinctMaterials": 2
+        },
+        {
+          "state": "MeshStandardNodeMaterial|opaque|side2|alphaTest0.35|blend1|depthWrite|layers1|order0|noCast|receives",
+          "draws": 2,
+          "distinctMaterials": 2
+        },
+        {
+          "state": "MeshBasicNodeMaterial|transparent|side2|noAlphaTest|blend1|noDepthWrite|layers1|order0|noCast|noReceive",
+          "draws": 2,
+          "distinctMaterials": 2
+        },
+        {
+          "state": "NodeMaterial|opaque|side1|noAlphaTest|blend1|noDepthWrite|layers1|order0|noCast|noReceive",
+          "draws": 1,
+          "distinctMaterials": 1
+        },
+        {
+          "state": "MeshPhysicalNodeMaterial|transparent|side0|noAlphaTest|blend1|noDepthWrite|layers1|order0|noCast|receives",
+          "draws": 1,
+          "distinctMaterials": 1
+        }
+      ]
+    },
+    {
+      "pass": "ShadowMap:4096x4096# (depth-only via NodeMaterial)",
+      "camera": "OrthographicCamera",
+      "draws": 30,
+      "triangles": 5831677,
+      "distinctMaterials": 18,
+      "distinctGeometries": 30,
+      "floorIfMerged": 5,
+      "byMaterial": [
+        {
+          "material": "Foliage · living surface",
+          "draws": 6,
+          "triangles": 3518826,
+          "objects": [
+            "oak-elder",
+            "oak-elder",
+            "accent",
+            "accent",
+            "hazel-study",
+            "hazel-study"
+          ]
+        },
+        {
+          "material": "Foliage · living surface",
+          "draws": 4,
+          "triangles": 1002994,
+          "objects": [
+            "birch-tall",
+            "birch-tall",
+            "young-growth",
+            "young-growth"
+          ]
+        },
+        {
+          "material": "World landscape · natural layered stone",
+          "draws": 3,
+          "triangles": 41608,
+          "objects": [
+            "Cliffs and rocks",
+            "Cliffs and rocks",
+            "Cliffs and rocks"
+          ]
+        },
+        {
+          "material": "Foliage · living surface",
+          "draws": 2,
+          "triangles": 248540,
+          "objects": [
+            "pine-tall",
+            "pine-tall"
+          ]
+        },
+        {
+          "material": "Foliage · living surface",
+          "draws": 2,
+          "triangles": 833264,
+          "objects": [
+            "oak-wide",
+            "oak-wide"
+          ]
+        },
+        {
+          "material": "MeshStandardNodeMaterial#b458b5",
+          "draws": 1,
+          "triangles": 131072,
+          "objects": [
+            "Terrain"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "hazel-study"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "young-growth"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "oak-wide"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "birch-tall"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "oak-elder"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "accent"
+          ]
+        },
+        {
+          "material": "Foliage · octahedral impostor",
+          "draws": 1,
+          "triangles": 2,
+          "objects": [
+            "pine-tall"
+          ]
+        },
+        {
+          "material": "Grass field · natural",
+          "draws": 1,
+          "triangles": 3,
+          "objects": [
+            "Grass ring 0"
+          ]
+        },
+        {
+          "material": "Grass field · natural",
+          "draws": 1,
+          "triangles": 24,
+          "objects": [
+            "Grass ring 1"
+          ]
+        },
+        {
+          "material": "Grass field · natural",
+          "draws": 1,
+          "triangles": 12,
+          "objects": [
+            "Grass ring 2"
+          ]
+        },
+        {
+          "material": "MeshPhysicalNodeMaterial#27b462",
+          "draws": 1,
+          "triangles": 34480,
+          "objects": [
+            "Body"
+          ]
+        },
+        {
+          "material": "MeshPhysicalNodeMaterial#0d3615",
+          "draws": 1,
+          "triangles": 20840,
+          "objects": [
+            "Alpha_Joints"
+          ]
+        }
+      ],
+      "splits": [
+        {
+          "state": "MeshStandardNodeMaterial|opaque|side2|alphaTest0.5|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 14,
+          "distinctMaterials": 4
+        },
+        {
+          "state": "MeshStandardNodeMaterial|opaque|side2|alphaTest0.35|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 7,
+          "distinctMaterials": 7
+        },
+        {
+          "state": "MeshStandardNodeMaterial|opaque|side0|noAlphaTest|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 4,
+          "distinctMaterials": 2
+        },
+        {
+          "state": "MeshPhysicalNodeMaterial|opaque|side2|noAlphaTest|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 3,
+          "distinctMaterials": 3
+        },
+        {
+          "state": "MeshPhysicalNodeMaterial|opaque|side0|noAlphaTest|blend1|depthWrite|layers1|order0|casts|receives",
+          "draws": 2,
+          "distinctMaterials": 2
+        }
+      ]
+    },
+    {
+      "pass": "canvas",
+      "camera": "OrthographicCamera",
+      "draws": 1,
+      "triangles": 1,
+      "distinctMaterials": 1,
+      "distinctGeometries": 1,
+      "floorIfMerged": 1,
+      "byMaterial": [
+        {
+          "material": "outputColorTransform",
+          "draws": 1,
+          "triangles": 1,
+          "objects": [
+            "Output Color Transform"
+          ]
+        }
+      ],
+      "splits": [
+        {
+          "state": "NodeMaterial|opaque|side0|noAlphaTest|blend1|depthWrite|layers1|order0|noCast|noReceive",
+          "draws": 1,
+          "distinctMaterials": 1
+        }
+      ]
+    }
+  ],
+  "merging": {
+    "enabled": false
+  },
+  "playing": true
+}

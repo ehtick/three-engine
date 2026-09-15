@@ -235,10 +235,6 @@ export class SceneManager {
       await this.#waitForEntityReadiness(alive);
       if (!alive()) return null;
 
-      const record = { path, name: engine.sceneName, mode, rootIds };
-      if (mode === "single") this.loaded = [record];
-      else this.loaded.push(record);
-
       const shouldSetCamera = setCamera === "auto" ? engine.playing : !!setCamera;
       if (shouldSetCamera && mode === "single") {
         // The outgoing scene's camera was just destroyed; without this the
@@ -247,6 +243,21 @@ export class SceneManager {
         const camera = findSceneCamera(engine.rootEntities);
         if (camera) engine.camera = camera;
       }
+
+      // Compile the level's pipelines before announcing it, so its first
+      // frames draw the scene instead of skipping draws while async pipelines
+      // land. Only a host holding a loading screen waits (the player sets
+      // `config.prewarmBlocking`; the call is time-bounded); the editor lets
+      // it run in the background.
+      const warm = engine.prewarmShaders?.({ reason: path });
+      if (warm && engine.config?.prewarmBlocking === true) {
+        await warm;
+        if (!alive()) return null;
+      }
+
+      const record = { path, name: engine.sceneName, mode, rootIds };
+      if (mode === "single") this.loaded = [record];
+      else this.loaded.push(record);
 
       report("instantiate", 1, 1);
       engine.emit("scene-loaded", { path, mode, name: record.name, rootIds });
@@ -310,6 +321,10 @@ export class SceneManager {
     // the scene being unloaded, and its prefab may not even exist in the next
     // one — handing it out in level 2 is worse than paying for a fresh spawn.
     engine.pool.reset();
+    // Same reasoning for three's URL loader cache: the outgoing level's raw
+    // file bytes are never evicted otherwise (see Engine.js's Cache note).
+    // After preload, whose fetches ride the browser's HTTP cache, not this.
+    engine.clearFileCache?.();
     engine.batchHierarchy(() => {
       // Persistent entities buried in the outgoing hierarchy would be
       // destroyed along with their ancestors. Unity solves this by moving

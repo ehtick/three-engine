@@ -2,7 +2,7 @@ import { ensureEngine } from "./engineInstance.js";
 import { isBuiltinMaterial } from "../engine/builtinMaterials.js";
 import { createAssetNames, basename } from "./build/assetNames.js";
 import { rewriteComponentAssets, rewriteVfxGraphAssets, DOCUMENT_KINDS, extOf, ASSET_EXTENSIONS } from "./build/assetRefs.js";
-import { selectRuntimeFiles, scriptImportSpecifiers } from "./build/runtimeFiles.js";
+import { selectRuntimeFiles, scriptImportSpecifiers, pagesHeaders, PAGES_HEADERS_PATH } from "./build/runtimeFiles.js";
 import { moduleIdsForComponentTypes } from "./build/moduleRefs.js";
 import {
   BUILD_DEFAULTS,
@@ -753,6 +753,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     const compression = await compressBuildAssets({
       names,
       build,
+      root,
       onProgress,
       warnings,
     });
@@ -766,6 +767,15 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     const generatedSidecarFiles = [];
     for (const [src] of names.copyEntries()) {
       if (!/\.(png|jpe?g|webp|glb|geom)$/i.test(src)) continue;
+      // A texture over the size cap ships its resampled build-cache derivative
+      // and a meta that points at it; the project's own meta and full-size
+      // `.basis` stay home.
+      const capped = compression.cappedTextures.get(src);
+      if (capped) {
+        generatedSidecarFiles.push([names.claimSidecar(src, ".meta"), JSON.stringify(capped.meta, null, 2)]);
+        sidecarCopies.push([capped.cache, names.claimSidecar(src, ".basis")]);
+        continue;
+      }
       try {
         await invoke("stat_file", { path: `${src}.meta` });
         sidecarCopies.push([`${src}.meta`, names.claimSidecar(src, ".meta")]);
@@ -956,7 +966,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
         const templateFiles = await invoke("list_player_template");
         const manifest = JSON.parse(await invoke("read_player_template", { rel: ".vite/manifest.json" }));
         const copySources = names.copyEntries().map(([source]) => source);
-        const dracoDecided = enabledModules.includes("draco") || !!build.compressModels;
+        const modelExtensions = await modelExtensionsUsed(invoke, copySources);
         runtime = selectRuntimeFiles({
           manifest,
           templateFiles,
@@ -966,7 +976,9 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
           livePreview: !!build.livePreview,
           compressTextures: !!build.compressTextures,
           compressModels: !!build.compressModels,
-          dracoModels: dracoDecided ? false : await anyDracoModel(invoke, copySources),
+          dracoModels: modelExtensions.has("KHR_draco_mesh_compression"),
+          meshoptModels: modelExtensions.has("EXT_meshopt_compression") || modelExtensions.has("KHR_meshopt_compression"),
+          basisModels: modelExtensions.has("KHR_texture_basisu"),
         });
       } catch (err) {
         runtime = null;
@@ -975,6 +987,11 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
             "Run `npm run build:player` to refresh the template.",
         );
       }
+    }
+    // Cloudflare Pages cache rules (publishGame uploads the web target). Not
+    // for the itch.io zip or the desktop shell — neither host reads it.
+    if (!isZip && !isDesktop) {
+      shippedFiles.push([PAGES_HEADERS_PATH, pagesHeaders({ files: runtime?.files ?? null })]);
     }
     const exportReport = await invoke("export_game", {
       outDir: contentDir,
@@ -1203,19 +1220,38 @@ export function findLeakedAbsolutePaths(files, root) {
  * `extensionsUsed`, inside the first 64 KB of any realistic file.
  */
 export async function anyDracoModel(invoke, sources) {
+  return (await modelExtensionsUsed(invoke, sources)).has("KHR_draco_mesh_compression");
+}
+
+/** glTF extensions whose decoders the player only ships on demand. */
+const DECODER_EXTENSIONS = [
+  "KHR_draco_mesh_compression",
+  "EXT_meshopt_compression",
+  "KHR_meshopt_compression",
+  "KHR_texture_basisu",
+];
+
+/**
+ * Which decoder-backed extensions any shipped model declares (Draco, meshopt,
+ * KTX2 textures) — same 64 KB `extensionsUsed` head scan for all of them.
+ */
+export async function modelExtensionsUsed(invoke, sources) {
   const decoder = new TextDecoder();
+  const found = new Set();
   for (const src of sources) {
     if (!/\.(glb|gltf)$/i.test(src)) continue;
     try {
       const head = await invoke("read_binary_file_head", { path: src, maxBytes: 65536 });
       const bytes =
         head instanceof ArrayBuffer ? new Uint8Array(head) : ArrayBuffer.isView(head) ? head : Uint8Array.from(head);
-      if (decoder.decode(bytes).includes("KHR_draco_mesh_compression")) return true;
+      const text = decoder.decode(bytes);
+      for (const name of DECODER_EXTENSIONS) if (text.includes(name)) found.add(name);
+      if (found.size === DECODER_EXTENSIONS.length) break;
     } catch {
-      // Unreadable here → the copy step reports it. Assume no Draco.
+      // Unreadable here → the copy step reports it. Assume no extensions.
     }
   }
-  return false;
+  return found;
 }
 
 async function pickOutputDirectory() {
@@ -1287,8 +1323,10 @@ async function stageIcon({ build, root, invoke, names, warnings }) {
  * Both are no-ops unless their module is enabled. A toggle that quietly does
  * nothing because a module is off is worse than one that refuses.
  */
-async function compressBuildAssets({ names, build, onProgress, warnings }) {
-  const result = { savedBytes: 0, count: 0, overwrites: [] };
+async function compressBuildAssets({ names, build, root, onProgress, warnings }) {
+  // cappedTextures: source -> { cache, meta } for textures resampled under the
+  // build's size cap (shipped by the sidecar step instead of the project's).
+  const result = { savedBytes: 0, count: 0, overwrites: [], cappedTextures: new Map() };
   const wantTextures = build.compressTextures;
   const wantModels = build.compressModels;
   if (!wantTextures && !wantModels) return result;
@@ -1296,11 +1334,13 @@ async function compressBuildAssets({ names, build, onProgress, warnings }) {
   const sources = names.copyEntries().map(([source]) => source);
 
   if (wantTextures) {
-    const { isBasisEnabled, compressTextureBasis } = await import("./basisCompress.js");
+    const { isBasisEnabled, compressTextureBasis, basisModeFor } = await import("./basisCompress.js");
     if (!isBasisEnabled()) {
       warnings.push("Texture compression is on but the Basis module is disabled — skipped.");
     } else {
       const { readAssetMeta } = await import("./assetLoader.js");
+      const { invoke } = await import("@tauri-apps/api/core");
+      const { imageDimensions, textureBuildSize, basisBuildCacheName } = await import("./build/textureBuildSize.js");
       const textures = sources.filter((p) => /\.(png|jpe?g)$/i.test(p));
       for (const [i, src] of textures.entries()) {
         onProgress({ phase: "compress", message: `Compressing textures ${i + 1}/${textures.length}…` });
@@ -1309,6 +1349,17 @@ async function compressBuildAssets({ names, build, onProgress, warnings }) {
         // texture is opted out because it *looked wrong* compressed, and a
         // build setting should not quietly undo that judgement.
         if (meta?.basis?.enabled === false) continue;
+        const capped = root
+          ? await cappedBasisDerivative({ invoke, src, meta, root, build, basisModeFor, imageDimensions, textureBuildSize, basisBuildCacheName })
+          : null;
+        if (capped?.error) {
+          warnings.push(`Texture size cap skipped for ${basename(src)}: ${capped.error}`);
+        } else if (capped) {
+          result.cappedTextures.set(src, capped);
+          result.savedBytes += capped.saved;
+          result.count++;
+          continue;
+        }
         if (meta?.basis?.enabled === true) continue; // already has a derivative
         try {
           const info = await compressTextureBasis(src);
@@ -1335,7 +1386,8 @@ async function compressBuildAssets({ names, build, onProgress, warnings }) {
         onProgress({ phase: "compress", message: `Compressing models ${i + 1}/${models.length}…` });
         try {
           const original = new Uint8Array(await invoke("read_binary_file", { path: source }));
-          const out = await compressGlbBuffer(original);
+          // Optimization rides on compressModels unless explicitly turned off.
+          const out = await compressGlbBuffer(original, { optimize: build.optimizeModels !== false });
           if (out && out.byteLength < original.byteLength) {
             result.overwrites.push([rel, out]);
             result.savedBytes += original.byteLength - out.byteLength;
@@ -1349,4 +1401,57 @@ async function compressBuildAssets({ names, build, onProgress, warnings }) {
   }
 
   return result;
+}
+
+/**
+ * The build's resampled Basis derivative for one texture over the size cap,
+ * or null when it ships at source size (under the cap, `maxSize: 0`, or its
+ * dimensions/meta can't be read). Encoded into `Library/build-cache/basis/`
+ * — never beside the source, where the editor's full-size `.basis` lives —
+ * and reused while the source, cap and codec are unchanged.
+ */
+async function cappedBasisDerivative({
+  invoke, src, meta, root, build, basisModeFor, imageDimensions, textureBuildSize, basisBuildCacheName,
+}) {
+  let size = null;
+  try {
+    const head = await invoke("read_binary_file_head", { path: src, maxBytes: 262144 });
+    const dims = imageDimensions(head instanceof ArrayBuffer ? new Uint8Array(head) : head);
+    size = dims && textureBuildSize(dims, meta, build.maxTextureSize);
+  } catch {
+    return null;
+  }
+  if (!size?.resized) return null;
+  if (!meta) {
+    // readAssetMeta answers null for "no meta" AND "unreadable meta"; a
+    // generated meta must not replace one we couldn't read (flipY/colorSpace).
+    const metaExists = await invoke("file_size", { path: `${src}.meta` }).then(() => true, () => false);
+    if (metaExists) return null;
+  }
+  try {
+    const mode = basisModeFor(src, meta);
+    const mtime = await invoke("stat_file", { path: src });
+    const cache = joinPath(
+      root,
+      `Library/build-cache/basis/${basisBuildCacheName(src, { mtime, mode, width: size.width, height: size.height })}`,
+    );
+    let compressed = await invoke("file_size", { path: cache }).catch(() => null);
+    if (compressed == null) {
+      const info = await invoke("compress_texture_basis", {
+        path: src,
+        mode,
+        resample: [size.width, size.height],
+        output: cache,
+      });
+      compressed = info?.compressed ?? 0;
+    }
+    const original = await invoke("file_size", { path: src }).catch(() => 0);
+    return {
+      cache,
+      saved: Math.max(0, Number(original) - Number(compressed)),
+      meta: { ...(meta ?? {}), basis: { enabled: true, mode, width: size.width, height: size.height } },
+    };
+  } catch (err) {
+    return { error: err?.message ?? String(err) };
+  }
 }

@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { EDITOR_LAYER } from "../engine/editorLayers.js";
 import { normalizeKnot } from "../engine/spline/splineMath.js";
+import { isNdcDepthInside } from "../engine/reversedDepth.js";
 import { engine } from "./engineInstance.js";
 import { vmSingleton } from "./singleton.js";
 import { commandBus } from "./commands/CommandBus.js";
@@ -433,7 +434,8 @@ export function pickCurve(clientX, clientY, rect, camera, pixelRadius = 10) {
   let best = null;
   for (let i = 0; i < spline.sampleCount; i++) {
     spline.samplePosition(i, _position).applyMatrix4(matrix).project(camera);
-    if (_position.z < -1 || _position.z > 1) continue;
+    // Depth range per camera convention (WebGPU [0,1], reversed [1,0]).
+    if (!isNdcDepthInside(_position.z, camera)) continue;
     const x = rect.left + (_position.x * 0.5 + 0.5) * rect.width;
     const y = rect.top + (-_position.y * 0.5 + 0.5) * rect.height;
     const d = Math.hypot(x - clientX, y - clientY);

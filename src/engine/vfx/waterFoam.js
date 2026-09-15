@@ -24,8 +24,19 @@ import { foamDetailTexture } from "./waterFoamTexture.js";
  */
 
 // ── NOISE PRIMITIVES ────────────────────────────────────────────────────────
-const hash = (p) => p.dot(vec2(127.1, 311.7)).sin().mul(43758.5453).fract();
-const hash2 = (p) => vec2(p.dot(vec2(127.1, 311.7)), p.dot(vec2(269.5, 183.3))).sin().mul(43758.5453).fract();
+// Hash without sine (Dave Hoskins hash12/hash22): `fract(sin(x)·43758)` bands
+// once float32 `sin` quantizes at large world-cell arguments (mobile GPUs worst).
+// fract/dot/mul only — identical in WGSL and the WebGL2 fallback. Range [0,1).
+const hash = (p) => {
+  const q = vec3(p.x, p.y, p.x).mul(.1031).fract();
+  const r = q.add(q.dot(q.yzx.add(33.33)));
+  return r.x.add(r.y).mul(r.z).fract();
+};
+const hash2 = (p) => {
+  const q = vec3(p.x, p.y, p.x).mul(vec3(.1031, .1030, .0973)).fract();
+  const r = q.add(q.dot(q.yzx.add(33.33)));
+  return vec2(r.x.add(r.y).mul(r.z), r.x.add(r.z).mul(r.y)).fract();
+};
 const valueNoise = Fn(([p]) => {
   const i = p.floor().toVar(), f = p.fract().toVar();
   const u = f.mul(f).mul(f.mul(-2).add(3));

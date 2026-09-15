@@ -4,6 +4,7 @@ import { positionView, vec4 } from "three/tsl";
 import { DepthPyramid, createBounds, isOccluded, projectSphere } from "./occlusionMath.js";
 import { getEntityBoundingSphere } from "../viewFrustum.js";
 import { OCCLUDER_LAYER, UI_LAYER } from "../editorLayers.js";
+import { createTextureReadback } from "../vfx/gpuReadback.js";
 
 /**
  * `engine.occlusion` — hides what the depth buffer says is already behind
@@ -91,6 +92,14 @@ export class OcclusionSystem {
     this.target = null;
     this.material = null;
     this.pending = false;
+    // The fallback (non-native-query) readback path: one persistent staging
+    // reader per target texture, one reused row-flip buffer, one reused Color
+    // — three's `readRenderTargetPixelsAsync` mints a fresh staging buffer per
+    // call (WebGPUTextureUtils.js) and this path used a fresh `THREE.Color()`
+    // every readback too.
+    this._occlusionReader = null;
+    this._occlusionRowsScratch = null;
+    this._previousClearColor = new THREE.Color();
     /** The camera the pending/current depth buffer was captured with. */
     this.captureView = new THREE.Matrix4();
     this.captureProjection = new THREE.Matrix4();
@@ -290,6 +299,34 @@ export class OcclusionSystem {
   #disposeTarget() {
     this.target?.dispose();
     this.target = null;
+    // The reader is bound to this target's texture; a new/resized target
+    // needs a new reader (staging buffer size follows width × height).
+    this._occlusionReader?.dispose();
+    this._occlusionReader = null;
+  }
+
+  /** The fallback path's persistent staging reader (WebGPU only — WebGL has
+   *  no `backend.device` and `createTextureReadback` returns null, so that
+   *  path keeps using `readRenderTargetPixelsAsync` below). */
+  #ensureReader(renderer) {
+    if (!renderer?.backend?.device) return null;
+    if (this._occlusionReader) return this._occlusionReader;
+    this._occlusionReader = createTextureReadback(renderer, this.target.texture, {
+      width: this.width, height: this.height, layers: 1, bytesPerTexel: 4, ArrayType: Float32Array,
+    });
+    return this._occlusionReader;
+  }
+
+  /** `packed` is already unpadded (the reader strips WebGPU's 256-byte row
+   *  padding), but still top-down; the pyramid wants bottom-up rows, same as
+   *  `toPyramidRows`'s WebGPU branch — reused buffer, no allocation. */
+  #flipRows(packed) {
+    const { width, height } = this;
+    const size = width * height;
+    let out = this._occlusionRowsScratch;
+    if (!out || out.length !== size) out = this._occlusionRowsScratch = new Float32Array(size);
+    for (let y = 0; y < height; y++) out.set(packed.subarray((height - 1 - y) * width, (height - y) * width), y * width);
+    return out;
   }
 
   #ensureMaterial() {
@@ -681,7 +718,7 @@ export class OcclusionSystem {
     const previousOverride = this.engine.scene.overrideMaterial;
     const previousMask = camera.layers.mask;
     const previousTransparent = renderer.transparent;
-    const previousClear = new THREE.Color();
+    const previousClear = this._previousClearColor;
     renderer.getClearColor(previousClear);
     const previousClearAlpha = renderer.getClearAlpha();
     const previousBackground = this.engine.scene.background;
@@ -732,6 +769,31 @@ export class OcclusionSystem {
     }
 
     this.pending = true;
+    const reader = this.#ensureReader(renderer);
+    if (reader) {
+      // ⚠ NOT `readRenderTargetPixelsAsync`: three's WebGPU backend mints and
+      // destroys a fresh staging buffer for every call
+      // (WebGPUTextureUtils.js). This reader owns one staging buffer for the
+      // target's whole life and only encodes a copy per read.
+      reader
+        .read()
+        .then((view) => {
+          if (!this.enabled || !view) return; // busy (another read in flight) or disposed: skip this frame
+          this.pyramid.build(this.#flipRows(view[0]), this.width, this.height);
+          this.captureView.copy(this.pendingView);
+          this.captureProjection.copy(this.pendingProjection);
+        })
+        .catch(() => {
+          // A readback can fail across a device loss or a renderer swap. Losing
+          // the buffer must never mean losing the scene, so the pyramid is
+          // dropped and everything hidden comes back.
+          this.reset();
+        })
+        .finally(() => {
+          this.pending = false;
+        });
+      return;
+    }
     renderer
       .readRenderTargetPixelsAsync(target, 0, 0, this.width, this.height)
       .then((raw) => {

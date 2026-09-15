@@ -32,6 +32,7 @@ import { applyEngineModules } from "../engine/modules.js";
 import { reloadMaterialAsset, refreshMaterialsUsingTexture } from "../engine/materialAsset.js";
 import { invalidateShaderTextureCache } from "../engine/tslGraph.js";
 import { invalidateGeometryAsset } from "../engine/geometryAsset.js";
+import { invalidateModelAsset } from "../engine/modelAsset.js";
 import { invalidateEnvironmentAsset } from "../engine/environmentAsset.js";
 import { invalidateAtlasAsset } from "../engine/sprite/atlasAsset.js";
 import { disposeAudioAsset } from "../engine/audio/AudioAsset.js";
@@ -173,7 +174,9 @@ export function installLiveUpdate(engine, { refreshScript }) {
         owned.push(rel);
       } else {
         // Models, fonts, timelines, animation controllers, future formats:
-        // fetched fresh by whichever component names them.
+        // fetched fresh by whichever component names them. Parsed GLBs are
+        // cached per path, so drop that parse before the re-attach.
+        if (/\.(glb|gltf)$/i.test(rel)) invalidateModelAsset(rel);
         owned.push(rel);
       }
     }

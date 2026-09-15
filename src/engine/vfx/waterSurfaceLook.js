@@ -1,4 +1,4 @@
-import { Color, DepthTexture, DoubleSide, MeshBasicNodeMaterial, Object3D, StorageTexture, Vector3 } from 'three/webgpu';
+import { Color, DepthTexture, DoubleSide, FloatType, MeshBasicNodeMaterial, Object3D, StorageTexture, Vector3 } from 'three/webgpu';
 import { WATER_REFRACTION_LAYER } from '../editorLayers.js';
 import { waterCausticGainNode } from './waterCaustics.js';
 import { applyMediumSegment } from './waterMedium.js';
@@ -116,11 +116,18 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     // census read five of them, 2026-09-07).
     const source = current?.depthTexture;
     const samples = Math.max(1, current ? (current.samples || 1) : (renderer.currentSamples || 1));
-    const key = `${samples}|${source?.type ?? ''}|${source?.format ?? ''}`;
+    // No source target = the canvas itself, whose depth is depth32float under a
+    // reversed buffer (WebGPUUtils.getCurrentDepthStencilFormat). A default
+    // DepthTexture is depth24plus there and `copyFramebufferToTexture` rejects
+    // the mismatch; the resolved type is in the key so a renderer rebuild that
+    // toggles it cannot reuse the old copy.
+    const type = source ? source.type : (renderer.reversedDepthBuffer === true ? FloatType : undefined);
+    const key = `${samples}|${type ?? ''}|${source?.format ?? ''}`;
     let depth = depthTextures.get(key);
     if (!depth) {
       depth = new DepthTexture(1, 1);
       if (source) { depth.type = source.type; depth.format = source.format; }
+      else if (type !== undefined) depth.type = type;
       depth.renderTarget = { samples };
       depthTextures.set(key, depth);
     }

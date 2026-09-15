@@ -2,8 +2,16 @@ import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
 import { buildRibbon } from "../vfx/ribbon.js";
 import { RibbonMesh, entitySubtreeVisible } from "../vfx/ribbonMesh.js";
-import { createRibbonMaterial, applyRibbonWrap } from "../vfx/vfxMaterial.js";
-import { loadTextureAsset } from "../textureAsset.js";
+import { createRibbonMaterial } from "../vfx/vfxMaterial.js";
+import { acquireTextureAsset, releaseTextureAsset } from "../textureAsset.js";
+
+/** The ribbon wrap is part of the shared texture's cache key, so no ribbon
+ *  mutates a texture another ribbon (or a material) renders. */
+const ribbonTextureOptions = (textureMode) => ({
+  colorSpace: THREE.SRGBColorSpace,
+  wrapS: textureMode === "tile" ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping,
+  wrapT: THREE.ClampToEdgeWrapping,
+});
 
 const _color = new THREE.Color();
 const _worldPosition = new THREE.Vector3();
@@ -112,7 +120,7 @@ export class TrailRendererComponent extends Component {
     this.unsubTick = null;
     this.ribbon?.dispose();
     this.ribbon = null;
-    this.loadedTexture?.dispose();
+    releaseTextureAsset(this.loadedTexture);
     this.loadedTexture = null;
     this.points = [];
   }
@@ -134,13 +142,12 @@ export class TrailRendererComponent extends Component {
   async #loadTexture(path) {
     const generation = this.generation;
     try {
-      const texture = await loadTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
+      const texture = await acquireTextureAsset(path, ribbonTextureOptions(this.props.textureMode));
       if (generation !== this.generation || !this.ribbon) {
-        texture.dispose();
+        releaseTextureAsset(texture);
         return;
       }
-      applyRibbonWrap(texture, this.props.textureMode);
-      this.loadedTexture?.dispose();
+      releaseTextureAsset(this.loadedTexture);
       this.loadedTexture = texture;
       this.#swapMaterial();
     } catch (err) {
@@ -305,7 +312,7 @@ export class TrailRendererComponent extends Component {
       if (this.props.texture) {
         this.#loadTexture(this.props.texture);
       } else {
-        this.loadedTexture?.dispose();
+        releaseTextureAsset(this.loadedTexture);
         this.loadedTexture = null;
         this.#swapMaterial();
       }
@@ -315,7 +322,8 @@ export class TrailRendererComponent extends Component {
       this.#swapMaterial();
       return;
     }
-    if (key === "textureMode") applyRibbonWrap(this.loadedTexture, this.props.textureMode);
+    // A different wrap is a different shared texture; re-acquire it.
+    if (key === "textureMode" && this.props.texture) this.#loadTexture(this.props.texture);
     // Everything else is read on the next tick.
   }
 }

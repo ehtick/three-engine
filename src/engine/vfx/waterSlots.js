@@ -136,7 +136,10 @@ function createSlot(index) {
     causticLayer: MAX_WATER_SLOTS + index,
     // The caustic lens at the volume floor: drawn into this target (see
     // `createWaterCausticPass`) and copied into layer `index` of the array.
-    causticTarget: causticTarget(index),
+    // Created lazily on `claim()` — a scene with no water for this slot must
+    // not pay for a 1024² half-float target it never renders into — and
+    // disposed on `release()`.
+    causticTarget: null,
     uniforms: {
       inverse: uniform(new THREE.Matrix4()),
       // (halfX, depth, halfZ), local units.
@@ -218,16 +221,37 @@ export function waterSlotPool(engine) {
   const node = texture(maps);
   const nodes = { surface: node, caustic: node };
   for (const slot of slots) { slot.surface = maps; slot.caustic = maps; slot.nodes = nodes; }
+  const liveScratch = [];   // reused by `live()`, cleared every call
   engine.waterSlots = {
     slots,
     claim(owner) {
       const free = slots.find((slot) => slot.owner === null || slot.owner === owner);
-      if (free) free.owner = owner;
+      if (free) {
+        free.owner = owner;
+        // Lazy: a slot claimed for the first time (or reclaimed after its
+        // target was disposed on release) gets its caustic target now.
+        free.causticTarget ??= causticTarget(free.index);
+      }
       return free ?? null;
     },
-    release(owner) { for (const slot of slots) if (slot.owner === owner) { slot.owner = null; slot.uniforms.active.value = 0; slot.uniforms.strength.value = 0; } },
-    /** Slots a consumer should actually read this frame. */
-    live() { return slots.filter((slot) => slot.owner && slot.uniforms.active.value > 0); },
+    release(owner) {
+      for (const slot of slots) if (slot.owner === owner) {
+        slot.owner = null; slot.uniforms.active.value = 0; slot.uniforms.strength.value = 0;
+        slot.causticTarget?.dispose(); slot.causticTarget = null;
+      }
+    },
+    /** Slots a consumer should actually read this frame. Reused array — a
+     *  caller must consume it before the next call, never retain it. */
+    live() {
+      liveScratch.length = 0;
+      for (const slot of slots) if (slot.owner && slot.uniforms.active.value > 0) liveScratch.push(slot);
+      return liveScratch;
+    },
+    /** Releases every slot's GPU resources — engine/pool teardown. */
+    dispose() {
+      for (const slot of slots) { slot.owner = null; slot.causticTarget?.dispose(); slot.causticTarget = null; }
+      maps.dispose();
+    },
     /**
      * What the per-material nodes (the medium, the caustic light) should be
      * COMPILED for: the slots up to the highest claimed one (at least the
@@ -337,6 +361,7 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
   // shadow at no per-material cost ("objects' shadows clip the god rays, as
   // they should", user, 2026-09-06). One compare against the sun's own
   // shadow map at the landing point; a 1×1 placeholder when there is none.
+  // Placeholder compare follows the renderer's depth convention (set in `render`).
   const shadowPlaceholder = new THREE.DepthTexture(1, 1); shadowPlaceholder.compareFunction = THREE.LessEqualCompare;
   const shadowDepth = texture(shadowPlaceholder);
   let shadowLogs = -1;
@@ -466,14 +491,18 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
   // no beam: it leaves the ortho camera's depth range and is clipped.
   const dry = waterRimDistanceNode(vec4(u.shape), half, rest.x, rest.z).lessThan(0);
   material.vertexNode = vec4(landed.x.sub(center.x).div(half2.x), landed.z.sub(center.y).div(half2.y).negate(), select(dry, float(2), float(0)), 1);
-  material.colorNode = Fn(() => {
+  // Zero-parameter Fn: three calls it with the builder (TSLCore `jsFunc(builder)`).
+  material.colorNode = Fn((builder) => {
     const oldArea = dFdx(oldPos).length().mul(dFdy(oldPos).length());
     const newArea = dFdx(newPos).length().mul(dFdy(newPos).length());
     const focus = oldArea.div(newArea.max(1e-12)).clamp(0, MAX_FOCUS);
     // The landing point in the sun's shadow map (three's coordinates: y down).
     const world = c.toWorld.mul(vec4(newPos, 1)).xyz;
     const sc = c.shadowMatrix.mul(vec4(world, 1));
-    const lit = shadowDepth.sample(vec2(sc.x, float(1).sub(sc.y))).compare(sc.z.add(c.shadowBias));
+    // Bias sign as three's ShadowNode applies it (ShadowNode.js:374): a
+    // reversed buffer stores nearer as LARGER depth, so the bias subtracts.
+    const reversed = builder?.renderer?.reversedDepthBuffer === true;
+    const lit = shadowDepth.sample(vec2(sc.x, float(1).sub(sc.y))).compare(reversed ? sc.z.sub(c.shadowBias) : sc.z.add(c.shadowBias));
     const visibility = select(c.shadowOn.greaterThan(.5), lit, float(1));
     return vec3(focus.mul(visibility));
   })();
@@ -489,6 +518,11 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
     /** One small draw per visible water surface, before the frame's own render. */
     render(renderer, { sun = null, shadowNode = null } = {}) {
       if (!renderer?.isWebGPURenderer) return;
+      // The slot's target is claim-scoped (lazy create, dispose on release) —
+      // a stray call after release must not render to the screen instead.
+      if (!slot.causticTarget) return;
+      const placeholderCompare = renderer.reversedDepthBuffer === true ? THREE.GreaterEqualCompare : THREE.LessEqualCompare;
+      if (shadowPlaceholder.compareFunction !== placeholderCompare) shadowPlaceholder.compareFunction = placeholderCompare;
       const depth = sun?.castShadow ? (shadowNode?.shadowMap?.depthTexture ?? sun.shadow?.map?.depthTexture ?? null) : null;
       if (depth && depth.compareFunction && sun.shadow.matrix) { c.shadowOn.value = 1; c.shadowMatrix.value.copy(sun.shadow.matrix); shadowDepth.value = depth; c.shadowBias.value = Number(sun.shadow.bias) || -.002; }
       else { c.shadowOn.value = 0; shadowDepth.value = shadowPlaceholder; }

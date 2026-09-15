@@ -5,7 +5,7 @@ import { shadow } from "three/tsl";
 import { ClipmapShadowNode } from "../src/engine/clipmapShadowNode.js";
 import { ShadowFreezeSystem } from "../src/engine/shadowFreeze.js";
 
-function fixture({ transformed = false, flattened = false, ...options } = {}) {
+function fixture({ transformed = false, flattened = false, reversed = false, ...options } = {}) {
   const scene = new THREE.Scene();
   const parent = new THREE.Object3D();
   if (transformed) {
@@ -24,11 +24,13 @@ function fixture({ transformed = false, flattened = false, ...options } = {}) {
   parent.add(light, light.target);
   const camera = new THREE.PerspectiveCamera(65, 16 / 9, 0.1, 300);
   camera.coordinateSystem = THREE.WebGPUCoordinateSystem;
+  // A reversed renderer reverses every camera it renders (Renderer._updateCamera).
+  camera._reversedDepth = reversed;
   camera.updateProjectionMatrix();
   scene.add(camera);
   scene.updateMatrixWorld(true);
   if (flattened) { scene.attach(light); scene.attach(light.target); }
-  const renderer = { coordinateSystem: THREE.WebGPUCoordinateSystem, reversedDepthBuffer: false, info: { render: { calls: 0 } } };
+  const renderer = { coordinateSystem: THREE.WebGPUCoordinateSystem, reversedDepthBuffer: reversed, info: { render: { calls: 0 } } };
   const clipmap = new ClipmapShadowNode(light, { levels: 3, nearSize: 20, scale: 4, cache: false, ...options });
   light.shadow.shadowNode = clipmap;
   clipmap._init({ camera, renderer });
@@ -57,6 +59,20 @@ test("a full camera turn and arbitrary projection edits leave every clipmap matr
     f.pose();
     assert.deepEqual(matrices(f.clipmap), before);
     assert.deepEqual(f.clipmap.lights.map((level) => level.shadow.matrix.toArray()), shadowBefore);
+  }
+});
+
+test("a reversed depth buffer changes no clipmap matrix and keeps them turn-invariant", () => {
+  const standard = fixture({ transformed: true });
+  const f = fixture({ transformed: true, reversed: true });
+  assert.equal(f.camera.reversedDepth, true);
+  const before = matrices(f.clipmap);
+  assert.deepEqual(before, matrices(standard.clipmap), "light-space grids do not depend on the depth convention");
+  for (let i = 0; i < 36; i++) {
+    f.camera.rotation.set(Math.sin(i) * 0.4, i * Math.PI / 18, 0);
+    f.camera.updateProjectionMatrix();
+    f.pose();
+    assert.deepEqual(matrices(f.clipmap), before);
   }
 });
 

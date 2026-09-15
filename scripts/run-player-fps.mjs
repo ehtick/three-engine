@@ -92,7 +92,10 @@ try {
     await page.evaluateOnNewDocument(() => { try { Object.defineProperty(navigator, "maxTouchPoints", { get: () => 5 }); } catch {} });
     say("mobile: iPhone user agent");
   }
-  const pageUrl = wantHud ? `${url}${url.includes("?") ? "&" : "?"}hud=1` : url;
+  // `timestamps=1`: the player resolves GPU timestamps only when asked, and
+  // every gpu reading (and the readiness wait below) needs them.
+  const withParam = (u, p) => `${u}${u.includes("?") ? "&" : "?"}${p}`;
+  const pageUrl = withParam(wantHud ? withParam(url, "hud=1") : url, "timestamps=1");
   say(`load ${pageUrl} at ${width}x${height} (dpr ${dpr}) label=${label} gi=${giMode}`);
   await page.goto(pageUrl, { waitUntil: "load", timeout: 60000 });
   await page.waitForFunction(() => {

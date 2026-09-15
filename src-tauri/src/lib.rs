@@ -383,11 +383,20 @@ async fn generate_motion(
 /// UASTC transcodes to BC7 either way — so it would shrink the file on disk
 /// and buy nothing in VRAM, while giving back exactly the precision this
 /// change exists to restore. KTX2 still Zstd-compresses UASTC payloads.
+///
+/// Build-only options (both optional, so import/inspector callers are unchanged):
+///   `resample` — `[width, height]` the encoder box-filters the source to
+///                (`-resample X Y`); the caller computes it from the build's
+///                texture size cap (`build/textureBuildSize.js`).
+///   `output`   — where to write instead of `<source>.basis`, so a capped
+///                build derivative never replaces the editor's full-size one.
 #[tauri::command]
 async fn compress_texture_basis(
     app: tauri::AppHandle,
     path: String,
     mode: Option<String>,
+    resample: Option<[u32; 2]>,
+    output: Option<String>,
 ) -> Result<BasisCompressionInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let exe_name = if cfg!(windows) {
@@ -425,13 +434,25 @@ async fn compress_texture_basis(
             .find(|candidate| candidate.exists())
             .ok_or("Basis encoder resource not found")?;
 
-        let output_path = format!("{path}.basis");
+        let output_path = output.unwrap_or_else(|| format!("{path}.basis"));
+        if let Some(parent) = Path::new(&output_path).parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         // Unknown / absent mode falls back to "srgb": it is the common case and
         // it is the one the old invocation got wrong. A data map reaching here
         // unlabelled is a caller bug, and an ETC1S data map is loud (dead
         // reflections) rather than silent, which is the failure we want.
         let mode = mode.as_deref().unwrap_or("srgb");
+        let resample_args: Vec<String> = match resample {
+            Some([w, h]) if w > 0 && h > 0 => vec![w.to_string(), h.to_string()],
+            Some(_) => return Err("resample needs a positive width and height".into()),
+            None => Vec::new(),
+        };
         let mut args: Vec<&str> = vec![path.as_str(), "-ktx2", "-mipmap"];
+        if !resample_args.is_empty() {
+            args.push("-resample");
+            args.extend(resample_args.iter().map(String::as_str));
+        }
         match mode {
             "linear" => args.extend_from_slice(&["-linear", "-uastc", "-uastc_level", "2"]),
             "normal" => args.extend_from_slice(&["-normal_map", "-uastc", "-uastc_level", "2"]),

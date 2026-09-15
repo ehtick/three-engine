@@ -14,7 +14,7 @@ const renderer = {
   reversedDepthBuffer: false,
 };
 
-function fixture(NodeClass = EngineCSMShadowNode, { flattened = false } = {}) {
+function fixture(NodeClass = EngineCSMShadowNode, { flattened = false, reversed = false } = {}) {
   const scene = new THREE.Scene();
   const owner = new THREE.Object3D();
   owner.rotation.set(-Math.PI / 3, 0.4, 0.2);
@@ -30,6 +30,8 @@ function fixture(NodeClass = EngineCSMShadowNode, { flattened = false } = {}) {
   owner.add(light, light.target);
   const camera = new THREE.PerspectiveCamera(65, 16 / 9, 0.1, 300);
   camera.coordinateSystem = THREE.WebGPUCoordinateSystem;
+  // A reversed renderer reverses every camera it renders (Renderer._updateCamera).
+  camera._reversedDepth = reversed;
   camera.updateProjectionMatrix();
   camera.position.set(30, 5, 25);
   scene.add(camera);
@@ -39,7 +41,7 @@ function fixture(NodeClass = EngineCSMShadowNode, { flattened = false } = {}) {
     scene.attach(light.target);
   }
   const csm = new NodeClass(light, { cascades: 4, maxFar: 150, lightMargin: 200 });
-  csm._init({ camera, renderer });
+  csm._init({ camera, renderer: reversed ? { ...renderer, reversedDepthBuffer: true } : renderer });
   light.shadow.shadowNode = csm;
   return { scene, owner, light, camera, csm };
 }
@@ -79,6 +81,18 @@ test("rotated and scaled light parents cover the view throughout a full camera t
   old.camera.rotation.y = 1.2;
   pose(old);
   assert.ok(coverage(old).clipped > 0, "upstream coordinate mismatch is a failing negative control");
+});
+
+test("a reversed depth buffer keeps full cascade coverage through a camera turn", () => {
+  const f = fixture(EngineCSMShadowNode, { reversed: true });
+  assert.equal(f.camera.reversedDepth, true);
+  assert.equal(f.csm.mainFrustum.vertices.near[0].z > f.csm.mainFrustum.vertices.far[0].z, true,
+    "near vertices sit in front of far ones (frustum read with the reversed convention)");
+  for (let i = 0; i < 72; i++) {
+    f.camera.rotation.set(0.2 * Math.sin(i), i * Math.PI / 36, 0);
+    pose(f);
+    assert.equal(coverage(f).clipped, 0, `reversed: camera yaw ${i * 5} degrees must remain shadowed`);
+  }
 });
 
 test("equivalent world light poses produce equivalent shadow matrices regardless of parenting", () => {

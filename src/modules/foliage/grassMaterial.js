@@ -109,14 +109,26 @@ export function createGrassUniforms() {
   };
 }
 
+// ⭐ HASH WITHOUT SINE (Dave Hoskins, hash22/hash13), 09-14. `fract(sin(x)·43758)`
+// was only as good as the GPU's `sin` at large arguments: world cells ×127 reach
+// millions of radians, where float32 `sin` quantizes (and mobile drivers differ),
+// so per-blade randomness banded. These use only fract/dot/mul — float-exact in
+// WGSL and the WebGL2 fallback alike (no uint casts, which clamp negative cells
+// to 0 in WGSL). CPU mirrors: `grassField.js#grassCellHash2`/`grassClumpHash`.
+
 /** Two values in [0,1) from one world cell. */
-const cellHash2 = /*@__PURE__*/ Fn(([cell]) => vec2(
-  fract(sin(cell.x.mul(127.1).add(cell.y.mul(311.7))).mul(43758.5453)),
-  fract(sin(cell.x.mul(269.5).add(cell.y.mul(183.3))).mul(24634.6345))));
+const cellHash2 = /*@__PURE__*/ Fn(([cell]) => {
+  const q = fract(vec3(cell.x, cell.y, cell.x).mul(vec3(.1031, .1030, .0973))).toVar();
+  const r = q.add(dot(q, q.yzx.add(33.33))).toVar();
+  return fract(vec2(r.x.add(r.y).mul(r.z), r.x.add(r.z).mul(r.y)));
+});
 
 /** One salted value in [0,1) from one world cell. */
-const cellHash1 = /*@__PURE__*/ Fn(([cell, salt]) =>
-  fract(sin(cell.x.mul(113.5).add(cell.y.mul(271.9)).add(salt.mul(74.7))).mul(31251.1234)));
+const cellHash1 = /*@__PURE__*/ Fn(([cell, salt]) => {
+  const q = fract(vec3(cell.x, cell.y, salt).mul(.1031)).toVar();
+  const r = q.add(dot(q, q.zyx.add(31.32))).toVar();
+  return fract(r.x.add(r.y).mul(r.z));
+});
 
 /** A unit gradient direction for one lattice corner, from a fixed set of 8
  * evenly-spaced directions (the standard discrete gradient set simplex noise

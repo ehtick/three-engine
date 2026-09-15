@@ -385,6 +385,10 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
   });
   let foamPhase = 0;
   let foamTarget = foamTargets[0];
+  // Reused across frames: `displacement`/`derivatives` never change identity,
+  // only the foam slot (index 2) ping-pongs — was a fresh `[a, b, c]` literal
+  // allocated every `generateMipmaps()` call.
+  const mipTargets = [displacement, derivatives, foamTarget.texture];
   // The pool is sized to the map: 128 k particles behind a 1024² map (a
   // 4 % whitecap coverage of the window is ~10 k m², three discs deep).
   const particleCount = seaQualityOptions.particles ?? (1024 * 1024) >> 3;   // the ultra pool on every tier (see seaQuality)
@@ -770,7 +774,10 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
       // once per GPU texture and only encodes passes here.
       const blitter = mipmapBlitter(renderer);
       if (!blitter) return;
-      for (const t of [displacement, derivatives, foamTarget.texture]) if (t) blitter.generate(t);
+      // One encoder, one submit for all three maps — was one of each per
+      // texture (three encoders/submits a frame just for mips).
+      mipTargets[2] = foamTarget.texture;
+      blitter.generateMany(mipTargets);
     },
     tick(renderer, dt, time, options) {
       const queue = spectrum.passes(dt, time, options);
