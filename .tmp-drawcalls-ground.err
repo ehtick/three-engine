@@ -1,4 +1,0 @@
-[three-engine] MCP server ready on stdio
-[three-engine] attached to bridge broker pid 22768 on port 17325
-[three-engine] editor connected (258 tools)
-profile.drawCalls failed: No frame was rendered during the capture window. The editor suspends an unfocused viewport and a GI compile wave suspends rendering outright — focus the viewport and retry.

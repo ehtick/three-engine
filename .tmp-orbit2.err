@@ -1,4 +1,0 @@
-[three-engine] MCP server ready on stdio
-[three-engine] attached to bridge broker pid 22768 on port 17325
-[three-engine] editor connected (258 tools)
-profile.orbit could not reach the editor: The editor did not answer "call" within 30000ms.
