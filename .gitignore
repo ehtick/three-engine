@@ -15,8 +15,10 @@ dist-ssr
 
 # Editor directories and files
 .vscode/*
-!.vscode/extensions.json
 .idea
+# Local GI scratch / backups — never shared; giant patches and dumped state
+# that have no business in the repo.
+.gi-backup/
 .DS_Store
 *.suo
 *.ntvs*
