@@ -18804,11 +18804,21 @@ export class GISystem {
       // the cap the field does not degrade — it re-asks
       // `occupancy-slot-capacity` and does another FULL rebuild, over and
       // over, which is what "the GI keeps breaking" looked like from the
-      // outside. Skipping the proxy halves placement pressure for every
-      // auto-batched scene and changes nothing about what GI sees, because
-      // the members it stands in for are all collected here already.
-      if (object.userData.batchProxy === true) return;
-      if (object.visible === false && !object.userData.batchedInto && !object.userData.cameraHidden) return;
+      // outside.
+      //
+      // ⛔ REVERSED 2026-09-15 (Bistro, "indirect 10x weaker + reflections dead",
+      // bisected to 3ae90ab and to THIS line by a single-line A/B): the
+      // hidden MEMBERS do not survive the seating downstream — with the proxy
+      // skipped, Bistro's 1466 auto-batched meshes vanished from the transport
+      // (slot atlas 104 → 66 materials, hit rate 65 % → 18 %, unattributed
+      // 5 % → 58 %, gathered irradiance at hits 0.12 → 0.005), which read as
+      // "no sun bounce" and "no reflections". The PROXY is the representation
+      // that reaches GI (one atlas instance slot per live instance, see below),
+      // so it is the member that is the duplicate: keep the proxy, skip the
+      // hidden members it stands in for. Placement pressure halves exactly as
+      // the ball-pool fix intended (400 instances + 5 walls, not 805).
+      if (object.visible === false && object.userData.batchedInto) return;
+      if (object.visible === false && !object.userData.cameraHidden) return;
       // InstancedMesh IS collected now — it contributes one atlas instance
       // slot per live instance, all sharing a single baked tile (see
       // #buildEntries). It used to be skipped outright, which meant every

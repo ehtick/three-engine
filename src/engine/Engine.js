@@ -2579,7 +2579,15 @@ export class Engine extends EventEmitter {
     // loaded, and cancel any load still in flight.
     this.scenes.reset();
     this.sceneName = "Untitled";
-    if (resetSettings) this.applySettings(structuredClone(SCENE_SETTINGS_DEFAULTS));
+    // `fromSceneLoad`: clearing to defaults is a SCENE transition (project open,
+    // New Scene, the reload-restore path), never a renderer edit. Without it,
+    // the boot sequence seed(last scene's renderer) → build → clear(DEFAULTS)
+    // → restore(scene) rebuilt the renderer on the clear — one destroyed GPU
+    // device per editor reload (2026-09-15, Bistro: "antialias false→true,
+    // samples 0→4" 90 ms after construction, then the scene's own options
+    // refused as a deferred scene switch). The deferred path keeps the built
+    // renderer; the scene that loads next matches it, so nothing rebuilds.
+    if (resetSettings) this.applySettings(structuredClone(SCENE_SETTINGS_DEFAULTS), { fromSceneLoad: true });
     this.emit("hierarchy-changed");
   }
 
